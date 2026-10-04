@@ -12,10 +12,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from ...analysis.metrics import EventAnalysisMetrics
 from ...domain.ids import parse_time
 from ...domain.schemas import AnalysisRun, EventState, EvidenceSummary, StateDelta
 from ..deps import RepoDep
 from ..schemas import (
+    AnalysisMetricsResponse,
     AnalysisResponse,
     AnalysisView,
     CurrentStateView,
@@ -80,6 +82,14 @@ def _current_state_view(state: EventState) -> CurrentStateView:
 
 def _analysis_view(run: AnalysisRun) -> AnalysisView:
     # Section 51: audit trail yes, model internals no.
+    metrics_obj = None
+    if run.metrics:
+        metrics_obj = (
+            run.metrics
+            if isinstance(run.metrics, EventAnalysisMetrics)
+            else EventAnalysisMetrics.model_validate(run.metrics)
+        )
+
     return AnalysisView(
         analysis_run_id=run.analysis_run_id,
         event_id=run.event_id,
@@ -92,6 +102,7 @@ def _analysis_view(run: AnalysisRun) -> AnalysisView:
         impacts=run.impacts,
         forecasts=run.forecasts,
         deltas=[d.model_dump(mode="json") for d in run.deltas],
+        metrics=metrics_obj,
         started_at=run.started_at,
         completed_at=run.completed_at,
     )
@@ -275,6 +286,36 @@ async def get_analysis(
     _event_row(repo, event_id)
     runs = [_analysis_view(r) for r in repo.runs.for_event(event_id, limit=limit)]
     return AnalysisResponse(event_id=event_id, count=len(runs), runs=runs)
+
+
+@router.get(
+    "/{event_id}/metrics",
+    response_model=AnalysisMetricsResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_event_metrics(event_id: str, repo: RepoDep) -> AnalysisMetricsResponse:
+    """Explicitly expose the complete intermediate analytical metrics (§10, §17, §18, §21-32, §43-47).
+
+    Preserves what the platform knows, what changed, why it reached a conclusion,
+    and how confident it is across all 10 analytical dimensions.
+    """
+    _event_row(repo, event_id)
+    run = repo.runs.latest_for_event(event_id)
+    if run is None or run.metrics is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no analysis metrics available for event '{event_id}'",
+        )
+    metrics_obj = (
+        run.metrics
+        if isinstance(run.metrics, EventAnalysisMetrics)
+        else EventAnalysisMetrics.model_validate(run.metrics)
+    )
+    return AnalysisMetricsResponse(
+        event_id=event_id,
+        analysis_run_id=run.analysis_run_id,
+        metrics=metrics_obj,
+    )
 
 
 @router.get(

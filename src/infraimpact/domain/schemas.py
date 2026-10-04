@@ -386,6 +386,7 @@ class AnalysisRun(BaseModel):
     impacts: tuple[AffectedInfrastructure, ...] = ()
     deltas: tuple[StateDelta, ...] = ()
     model_outputs: tuple[ModelOutput, ...] = ()
+    metrics: Any = None
 
     started_at: datetime
     completed_at: datetime

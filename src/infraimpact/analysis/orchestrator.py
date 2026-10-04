@@ -111,6 +111,7 @@ class AnalysisOutcome:
     notes: list[str] = field(default_factory=list)
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    metrics: Any = None
 
     @property
     def deltas(self) -> tuple[StateDelta, ...]:
@@ -310,11 +311,32 @@ class AnalysisOrchestrator:
         if champion_forecasts:
             forecasts = merge_forecasts(forecasts, champion_forecasts)
 
+        analysis_run_id = deterministic_id(
+            "run", event_id, state.state_version, started_at.isoformat()
+        )
+        from .metrics import derive_analysis_metrics
+        history_tracker = getattr(self.repo, "history", None)
+        all_notes = [*notes, *delta_report.notes, *selection.notes]
+        derived_metrics = derive_analysis_metrics(
+            state=state,
+            previous_state=previous_state,
+            observations=observations,
+            claims=claims,
+            impacts=impacts,
+            forecasts=forecasts,
+            delta_report=delta_report,
+            features=results.features,
+            model_outputs=all_model_outputs,
+            graph=self.graph,
+            model_registry=self.model_registry,
+            history=history_tracker,
+            notes=all_notes,
+            analysis_run_id=analysis_run_id,
+        )
+
         outcome = AnalysisOutcome(
             event_id=event_id,
-            analysis_run_id=deterministic_id(
-                "run", event_id, state.state_version, started_at.isoformat()
-            ),
+            analysis_run_id=analysis_run_id,
             trigger=trigger,
             trigger_observation_id=trigger_observation_id,
             state=state,
@@ -328,9 +350,10 @@ class AnalysisOrchestrator:
             jev_decisions=jev_decisions,
             hypotheses=list(hypotheses),
             narrative=narrative,
-            notes=[*notes, *delta_report.notes, *selection.notes],
+            notes=all_notes,
             started_at=started_at,
             completed_at=completed_at,
+            metrics=derived_metrics,
         )
 
         self._persist(outcome)
@@ -561,6 +584,7 @@ class AnalysisOrchestrator:
                 impacts=tuple(outcome.impacts),
                 deltas=outcome.deltas,
                 model_outputs=tuple(outcome.model_outputs),
+                metrics=outcome.metrics.model_dump(mode="json") if hasattr(outcome.metrics, "model_dump") else outcome.metrics,
                 started_at=outcome.started_at or utcnow(),
                 completed_at=outcome.completed_at or utcnow(),
                 software_versions={"orchestrator": "1.0.0"},

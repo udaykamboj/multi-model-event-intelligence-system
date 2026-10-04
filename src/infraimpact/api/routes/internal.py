@@ -120,6 +120,7 @@ async def post_analysis_request(request: Request, payload: AnalysisRequest) -> d
         "capabilities_skipped": [list(s) for s in outcome.capabilities_skipped],
         "impacts": len(outcome.impacts),
         "forecasts": len(outcome.forecasts),
+        "metrics": outcome.metrics.as_dict() if hasattr(outcome.metrics, "as_dict") else None,
         "notes": outcome.notes,
         "completed_at": utcnow().isoformat(),
     }
@@ -287,6 +288,37 @@ async def post_models_metrics(payload: MetricsEvaluationRequest) -> dict[str, An
     pairs = list(zip(payload.predictions, payload.ground_truth, horizons))
     report = evaluate_forecasts(pairs)
     return report.as_dict()
+
+
+@router.get("/analysis/{event_id}", responses={404: {"model": ErrorResponse}})
+async def get_internal_analysis(request: Request, event_id: str) -> dict[str, Any]:
+    """Deep inspection of the latest analysis run including intermediate analytical metrics,
+    features, model outputs, hypotheses, and state deltas (§10, §17, §18, §21-32, §43-47).
+    """
+    repo = get_repository(request)
+    run = repo.runs.latest_for_event(event_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no analysis run found for event '{event_id}'",
+        )
+    return {
+        "event_id": event_id,
+        "analysis_run_id": run.analysis_run_id,
+        "state_version": run.new_state_version,
+        "capabilities_invoked": list(run.capabilities_invoked),
+        "capabilities_skipped": [list(s) for s in run.capabilities_skipped],
+        "models_invoked": list(run.models_invoked),
+        "features": {k: v.model_dump(mode="json") for k, v in run.features.items()},
+        "model_outputs": [m.model_dump(mode="json") for m in run.model_outputs],
+        "hypotheses": list(run.hypotheses),
+        "metrics": run.metrics,
+        "impacts": [i.model_dump(mode="json") for i in run.impacts],
+        "forecasts": [f.model_dump(mode="json") for f in run.forecasts],
+        "deltas": [d.model_dump(mode="json") for d in run.deltas],
+        "started_at": run.started_at.isoformat(),
+        "completed_at": run.completed_at.isoformat(),
+    }
 
 
 __all__ = ["router"]

@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from ..analysis.metrics import EventAnalysisMetrics
 from ..domain.schemas import (
     SCHEMA_VERSION,
     AffectedInfrastructure,
@@ -154,8 +155,16 @@ class AnalysisView(BaseModel):
     impacts: tuple[AffectedInfrastructure, ...] = ()
     forecasts: tuple[Forecast, ...] = ()
     deltas: tuple[dict[str, Any], ...] = ()
+    metrics: EventAnalysisMetrics | None = None
     started_at: datetime
     completed_at: datetime
+
+
+class AnalysisMetricsResponse(BaseModel):
+    schema_version: str = SCHEMA_VERSION
+    event_id: str
+    analysis_run_id: str
+    metrics: EventAnalysisMetrics
 
 
 class AnalysisResponse(BaseModel):
