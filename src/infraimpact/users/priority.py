@@ -79,6 +79,9 @@ class PriorityContext:
 class UserPriorityEngine:
     """Scores one user's priority for one event."""
 
+    def __init__(self, jev: Any | None = None) -> None:
+        self.jev = jev
+
     def compute(self, ctx: PriorityContext) -> UserPriority:
         components = {
             "impact_magnitude": self._impact_magnitude(ctx),
@@ -87,6 +90,37 @@ class UserPriorityEngine:
             "change_magnitude": self._change_magnitude(ctx),
             "evidence_confidence": self._evidence_confidence(ctx),
         }
+
+        # Section 21: Jev bounded decision queries
+        jev_decisions: dict[str, Any] = {}
+        if self.jev is not None:
+            try:
+                from ..jev.client import JevQuestion
+                questions = [
+                    JevQuestion(
+                        question_id="route_materially_affected",
+                        kind="noul",
+                        text="Does the new state materially affect this user's route?",
+                        state={
+                            "route_impacted": bool(ctx.exposure.route_impacts),
+                            "user_exposure": ctx.exposure.exposure_score,
+                        },
+                    ),
+                    JevQuestion(
+                        question_id="urgency_score",
+                        kind="score",
+                        text="Rate the urgency of this user's infrastructure impact.",
+                        state={
+                            "exposure_score": ctx.exposure.exposure_score,
+                            "change_magnitude": components["change_magnitude"],
+                            "confidence": components["evidence_confidence"],
+                        },
+                    ),
+                ]
+                jev_decisions = self.jev.ask(questions)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("jev priority decision failed: %r", exc)
+
         components["product"] = self._product(components)
 
         priority = self._geometric_mean(components)
@@ -104,14 +138,21 @@ class UserPriorityEngine:
             evidence_confidence=round(components["evidence_confidence"], 4),
             priority=round(priority, 4),
             urgency_band=self._urgency_band(ctx),
-            components=self._public_components(components, official),
+            components=self._public_components(components, official, jev_decisions),
         )
 
     @staticmethod
-    def _public_components(components: dict[str, float], official: bool) -> dict[str, float]:
+    def _public_components(
+        components: dict[str, float], official: bool, jev_decisions: dict[str, Any] | None = None
+    ) -> dict[str, float]:
         """Factors as stored on the contract, without the scratch product."""
         public = {k: round(v, 4) for k, v in components.items() if k != "product"}
         public["official_guidance"] = 1.0 if official else 0.0
+        if jev_decisions:
+            for k, d in jev_decisions.items():
+                val = d.get("value")
+                if isinstance(val, (int, float)):
+                    public[f"jev_{k}"] = round(float(val), 4)
         return public
 
     # -- factors ----------------------------------------------------------

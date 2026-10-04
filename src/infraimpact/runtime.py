@@ -206,11 +206,12 @@ class Runtime:
         )
 
         self.exposure_engine = ExposureEngine(self.graph)
-        self.priority_engine = UserPriorityEngine()
+        self.priority_engine = UserPriorityEngine(jev=self.orchestrator.jev)
         self.presentation_engine = PresentationEngine()
         self.notification_engine = NotificationEngine(
             timezone=self.region.timezone,
             repository=self.repo.notifications,
+            jev=self.orchestrator.jev,
         )
 
         self._cycle = 0
@@ -236,6 +237,17 @@ class Runtime:
 
     async def start(self) -> None:
         await self._ensure_started()
+        # Self-running guarantee: ensure configured user context exists so exposure
+        # and personalized priority engine run without manual seeding
+        if hasattr(self.repo, "users") and not self.repo.users.all():
+            try:
+                from .cli import DEMO_USERS
+                for u in DEMO_USERS:
+                    self.repo.users.upsert(u)
+                log.info("auto-seeded default user contexts for self-running platform")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("could not auto-seed users: %r", exc)
+
         log.info(
             "runtime started: region=%s sources=%d tz=%s",
             self.region.region_id,

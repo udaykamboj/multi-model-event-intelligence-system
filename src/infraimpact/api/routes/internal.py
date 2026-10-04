@@ -197,4 +197,96 @@ async def post_models_evaluate(request: Request, payload: EvaluateRequest) -> di
     }
 
 
+@router.get("/models/registry")
+async def get_models_registry(request: Request) -> dict[str, Any]:
+    """Section 47/50: inspect the model registry, champion, challenger, and shadow models."""
+    runtime = get_runtime(request)
+    reg = getattr(runtime.orchestrator, "model_registry", None)
+    if reg is None:
+        from ...models.portfolio import build_default_model_registry
+        reg = build_default_model_registry()
+    return {
+        "models": reg.list_models(),
+        "total": len(reg),
+    }
+
+
+class PromoteModelRequest(BaseModel):
+    model_id: str
+    target_mode: str = Field(description="'champion', 'challenger', or 'shadow'")
+
+
+@router.post("/models/promote", responses={404: {"model": ErrorResponse}})
+async def post_models_promote(request: Request, payload: PromoteModelRequest) -> dict[str, Any]:
+    """Section 47: promote a model between shadow, challenger, and champion modes."""
+    from ...models.base import ModelDeploymentMode
+    runtime = get_runtime(request)
+    reg = getattr(runtime.orchestrator, "model_registry", None)
+    if reg is None:
+        raise HTTPException(status_code=404, detail="no model registry configured")
+    try:
+        mode = ModelDeploymentMode(payload.target_mode.lower())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid target_mode '{payload.target_mode}'; expected champion, challenger, or shadow",
+        )
+    success = reg.promote(payload.model_id, mode)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"model '{payload.model_id}' not found in registry")
+    return {
+        "model_id": payload.model_id,
+        "new_deployment_mode": mode.value,
+        "promoted": True,
+    }
+
+
+class TrainingDatasetRequest(BaseModel):
+    event_id: str
+    horizons_minutes: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])
+    sample_step_minutes: int = 15
+
+
+@router.post("/training/dataset", responses={404: {"model": ErrorResponse}})
+async def post_training_dataset(request: Request, payload: TrainingDatasetRequest) -> dict[str, Any]:
+    """Section 46: extract a point-in-time, leak-free training dataset for an event."""
+    repo = get_repository(request)
+    from ...evaluation.training import PointInTimeDatasetBuilder
+
+    state = repo.states.latest(payload.event_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"no event found for id '{payload.event_id}'")
+
+    builder = PointInTimeDatasetBuilder(repo)
+    examples = builder.build_examples_for_event(
+        event_id=payload.event_id,
+        horizons_minutes=tuple(payload.horizons_minutes),
+        sample_step_minutes=payload.sample_step_minutes,
+    )
+    return {
+        "event_id": payload.event_id,
+        "example_count": len(examples),
+        "examples": [e.as_dict() for e in examples],
+    }
+
+
+class MetricsEvaluationRequest(BaseModel):
+    predictions: list[float]
+    ground_truth: list[float]
+    horizons_minutes: list[int] | None = None
+
+
+@router.post("/models/metrics")
+async def post_models_metrics(payload: MetricsEvaluationRequest) -> dict[str, Any]:
+    """Section 45: compute Brier score, ECE, precision, recall, and F1."""
+    from ...evaluation.metrics import evaluate_forecasts
+
+    if len(payload.predictions) != len(payload.ground_truth):
+        raise HTTPException(status_code=400, detail="predictions and ground_truth must have equal length")
+    horizons = payload.horizons_minutes or [30] * len(payload.predictions)
+    pairs = list(zip(payload.predictions, payload.ground_truth, horizons))
+    report = evaluate_forecasts(pairs)
+    return report.as_dict()
+
+
 __all__ = ["router"]

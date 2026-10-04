@@ -60,8 +60,10 @@ SCHEMA_VERSION = "1.0.0"
 DEPENDENCY_ORDER = (
     "source_conflict_analysis",    # -> information_confidence
     "event_classification",        # -> event_class
+    "historical_similarity",       # -> historical similarity & analogues
     "road_network_exposure",       # -> arterial_overlap_count, road_overlap_count
     "transit_disruption",          # -> transit_route_overlap, transit_route_redundancy
+    "transit_disruption_forecast", # -> transit delay & cancellation forecasts
     "critical_facility_exposure",  # -> critical_facility_inside
     "user_route_exposure",         # -> route_redundancy
     "infrastructure_propagation",  # -> propagation_reach
@@ -159,6 +161,7 @@ class AnalysisOrchestrator:
         jev: JevClient | None = None,
         delta_engine: StateDeltaEngine | None = None,
         interpretation: InterpretationLayer | None = None,
+        model_registry: Any | None = None,
         budget_per_run: int = 12,
     ) -> None:
         self.repo = repository
@@ -171,6 +174,11 @@ class AnalysisOrchestrator:
         )
         self.jev = jev or build_jev_client()
         self.delta = delta_engine or StateDeltaEngine()
+        if model_registry is None:
+            from ..models.portfolio import build_default_model_registry
+            self.model_registry = build_default_model_registry()
+        else:
+            self.model_registry = model_registry
         #: Section 18 interpretation/orchestration. Optional and advisory: with
         #: no client the orchestrator runs identically minus the prose, which is
         #: the behaviour every test in this suite exercises.
@@ -263,6 +271,45 @@ class AnalysisOrchestrator:
                 log.warning("evidence synthesis failed for %s: %r", event_id, exc)
 
         completed_at = utcnow()
+
+        # Section 44 & 47: Run champion, challenger & shadow models from registry
+        registry_outputs: list[ModelOutput] = []
+        champion_forecasts: list[Forecast] = []
+        if self.model_registry is not None:
+            from ..models.base import ModelContext, ModelTaskType
+            m_ctx = ModelContext(
+                event_id=event_id,
+                state_version=state.state_version,
+                features=results.features,
+                state=state,
+                observations=observations,
+            )
+            for task_type in ModelTaskType:
+                champ = self.model_registry.get_champion(task_type)
+                if champ is not None:
+                    try:
+                        champ_pred = champ.predict(m_ctx)
+                        registry_outputs.append(champ.to_model_output(champ_pred, state.state_version))
+                        # Only real, non-placeholder forecasts enter the public forecast list
+                        if not champ_pred.is_placeholder and champ_pred.forecasts:
+                            champion_forecasts.extend(champ_pred.forecasts)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("champion inference failed for %s: %r", champ.model_id, exc)
+
+                for side_model in [
+                    *self.model_registry.get_challengers(task_type),
+                    *self.model_registry.get_shadows(task_type),
+                ]:
+                    try:
+                        side_pred = side_model.predict(m_ctx)
+                        registry_outputs.append(side_model.to_model_output(side_pred, state.state_version))
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("side inference failed for %s: %r", side_model.model_id, exc)
+
+        all_model_outputs = [*results.model_outputs, *registry_outputs]
+        if champion_forecasts:
+            forecasts = merge_forecasts(forecasts, champion_forecasts)
+
         outcome = AnalysisOutcome(
             event_id=event_id,
             analysis_run_id=deterministic_id(
@@ -275,7 +322,7 @@ class AnalysisOrchestrator:
             features=dict(results.features),
             impacts=impacts,
             forecasts=forecasts,
-            model_outputs=list(results.model_outputs),
+            model_outputs=all_model_outputs,
             capabilities_invoked=invoked,
             capabilities_skipped=selection.skipped_reasons,
             jev_decisions=jev_decisions,

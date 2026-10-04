@@ -102,7 +102,7 @@ class WorldStateEngine:
         evidence = self._evidence(ordered, claims, affected, now)
         status = self._status(ordered, now)
         distribution = self._type_distribution(ordered)
-        derived = self._derived(geometry, ordered, movement, affected)
+        derived = self._derived(geometry, ordered, movement, affected, evidence)
 
         return EventState(
             event_id=event_id,
@@ -262,7 +262,10 @@ class WorldStateEngine:
         obs_types = Counter(str(o.observation_type) for o in observations)
 
         # Section 40: independent corroboration discounts dependent sources.
-        independent = _independent_source_count(observations)
+        from ..sources.dependency import SourceDependencyGraph
+
+        corroboration = SourceDependencyGraph().analyze_corroboration(observations)
+        independent = corroboration.independent_source_count
 
         contradictions = 0
         by_predicate: dict[str, set[str]] = defaultdict(set)
@@ -279,6 +282,8 @@ class WorldStateEngine:
         vector = {
             "source_authority": _authority_score(authorities),
             "independent_corroboration": round(min(1.0, independent / 3.0), 4),
+            "corroboration_score": corroboration.corroboration_score,
+            "independence_ratio": corroboration.independence_ratio,
             "freshness": _freshness_score(freshness),
             "spatial_precision": round(
                 sum(o.quality.spatial_precision for o in observations) / len(observations), 4
@@ -344,14 +349,20 @@ class WorldStateEngine:
         observations: Sequence[Observation],
         movement: MovementState,
         affected: Sequence[AffectedInfrastructure],
+        evidence: EvidenceSummary | None = None,
     ) -> dict[str, float]:
         footprint = geometry_area_m2(geometry) if geometry else 0.0
         domains = {a.domain for a in affected}
+        independent_sources = (
+            float(evidence.independent_source_count)
+            if evidence is not None
+            else float(len({o.source_id for o in observations}))
+        )
         return {
             "footprint_area_m2": round(footprint, 1),
             "footprint_radius_m": round((footprint / 3.14159) ** 0.5, 1) if footprint else 0.0,
             "observation_count": float(len(observations)),
-            "independent_sources": float(len({o.source_id for o in observations})),
+            "independent_sources": independent_sources,
             "moving": 1.0 if movement.moving else 0.0,
             "movement_speed": movement.speed_estimate_m_per_min or 0.0,
             "affected_domains": float(len(domains)),

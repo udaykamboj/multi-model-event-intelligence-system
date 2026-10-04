@@ -338,6 +338,43 @@ class TestInternalRoutes:
     def test_models_evaluate_without_state_is_404(self, app_client):
         assert app_client.post("/internal/models/evaluate", json={"event_id": "nope"}).status_code == 404
 
+    def test_internal_models_registry_and_promotion(self, app_client):
+        reg_resp = app_client.get("/internal/models/registry").json()
+        assert "models" in reg_resp
+        assert reg_resp["total"] >= 5
+        models = reg_resp["models"]
+        first_model = models[0]["model_id"]
+
+        # Promote to challenger
+        promote_resp = app_client.post(
+            "/internal/models/promote",
+            json={"model_id": first_model, "target_mode": "challenger"},
+        ).json()
+        assert promote_resp["promoted"] is True
+        assert promote_resp["new_deployment_mode"] == "challenger"
+
+    def test_internal_training_dataset_extraction(self, app_client):
+        resp = app_client.post("/internal/training/dataset", json={"event_id": "evt_1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["event_id"] == "evt_1"
+        assert "examples" in body
+
+    def test_internal_models_metrics_evaluation(self, app_client):
+        resp = app_client.post(
+            "/internal/models/metrics",
+            json={
+                "predictions": [0.85, 0.20, 0.90, 0.10],
+                "ground_truth": [1.0, 0.0, 1.0, 0.0],
+                "horizons_minutes": [30, 30, 30, 30],
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "brier_score" in body
+        assert "expected_calibration_error" in body
+        assert body["sample_count"] == 4
+
 
 # --------------------------------------------------------------------------
 # regions / ops

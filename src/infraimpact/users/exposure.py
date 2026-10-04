@@ -190,6 +190,23 @@ class ExposureEngine:
         """
         if self.graph is None or not route.node_ids:
             return None
+
+        # Section 29: Use GraphRoutingEngine to find and verify alternative paths
+        from ..graph.routing import GraphRoutingEngine
+
+        if len(route.node_ids) >= 2:
+            router = GraphRoutingEngine(self.graph)
+            router.apply_closures(blocked)
+            alts = router.alternatives(
+                origin_node_id=route.node_ids[0],
+                destination_node_id=route.node_ids[-1],
+                max_routes=1,
+                avoid_disruptions=True,
+            )
+            for alt in alts:
+                if alt.verified_clear_of_disruptions and alt.geometry:
+                    return alt.geometry
+
         blocked_set = set(blocked)
         for node_id in route.node_ids:
             if node_id in blocked_set:

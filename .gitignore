@@ -59,6 +59,9 @@ data/research/
 # --- Scratch / prior work ---
 scratch/
 unused/
+transit_gtfs/
+infrastructure_gis/
+run-markdown-file-at-start.json
 smoke.py
 api_check.py
 

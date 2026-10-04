@@ -77,6 +77,20 @@ async def get_user_impacts(
 
 
 @router.get(
+    "/{user_id}/exposure",
+    response_model=UserImpactsResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_user_exposure_by_path(
+    user_id: str,
+    repo: RepoDep,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> UserImpactsResponse:
+    """Direct RESTful path: What is affecting this user right now, most severe first."""
+    return await get_user_impacts(repo=repo, user_id=user_id, limit=limit)
+
+
+@router.get(
     "/routes/{route_id}/impact",
     response_model=RouteImpactResponse,
     responses={404: {"model": ErrorResponse}},

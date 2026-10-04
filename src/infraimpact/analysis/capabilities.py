@@ -190,14 +190,18 @@ def build_default_registry(graph: InfrastructureGraph | None = None) -> Capabili
         TimeToImpactCapability,
         TrafficAnomalyCapability,
     )
+    from .similarity import HistoricalSimilarityCapability
+    from .transit import TransitDisruptionCapability
     from .uncertainty import SourceConflictCapability
 
     registry = CapabilityRegistry()
     for capability in (
         EventClassificationCapability(),
+        HistoricalSimilarityCapability(),
         SourceConflictCapability(),
         RoadOverlapCapability(graph),
         TransitOverlapCapability(graph),
+        TransitDisruptionCapability(graph),
         CriticalFacilityExposureCapability(graph),
         PropagationCapability(graph),
         TrafficAnomalyCapability(),

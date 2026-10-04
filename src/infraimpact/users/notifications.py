@@ -123,10 +123,12 @@ class NotificationEngine:
         timezone: str = "UTC",
         repeat_window_s: float = _DEFAULT_REPEAT_WINDOW_S,
         repository: NotificationRepository | None = None,
+        jev: Any | None = None,
     ) -> None:
         self.tz = ZoneInfo(timezone)
         self.repeat_window_s = repeat_window_s
         self.repo = repository
+        self.jev = jev
 
     # -- pipeline ---------------------------------------------------------
 
@@ -151,6 +153,30 @@ class NotificationEngine:
 
         bypassed: list[str] = []
         notes: list[str] = []
+
+        # Section 21: Jev bounded decision for notification worthiness
+        if self.jev is not None:
+            try:
+                from ..jev.client import JevQuestion
+                q = JevQuestion(
+                    question_id="notification_worthy",
+                    kind="choice",
+                    text="Is this change important enough to surface prominently to the user?",
+                    options=["notify", "suppress", "defer"],
+                    state={
+                        "priority": ctx.priority.priority,
+                        "exposure": ctx.exposure.exposure_score,
+                        "urgency": ctx.priority.urgency,
+                        "official": bool(has_official_guidance(ctx.state)),
+                    },
+                )
+                res = self.jev.ask([q])
+                val = res.get("notification_worthy", {}).get("value")
+                if val:
+                    notes.append(f"jev:notification_worthy={val}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("jev notification check failed: %r", exc)
+
         for check in (
             self._policy_check(ctx, now),
             self._dedupe(candidate),
