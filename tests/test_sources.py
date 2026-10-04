@@ -633,3 +633,118 @@ def test_feed_snapshot_files_are_json_serialisable_and_stable():
     adapter = reg.ADAPTERS[spec.adapter](spec, root=root)
     for record in adapter.poll(None):
         json.dumps(record.payload, default=str)
+
+
+# --------------------------------------------------------------------------
+# live source collector tests (§4-7)
+# --------------------------------------------------------------------------
+
+
+def test_live_source_collector_endpoints():
+    """Verify live source endpoints are configured for all real Puget Sound feeds."""
+    from infraimpact.sources.collector import LIVE_SOURCE_ENDPOINTS, LiveSourceCollector
+
+    collector = LiveSourceCollector()
+    assert len(collector.endpoints) >= 12
+    filenames = {ep.target_filename for ep in collector.endpoints}
+    assert "seattle_fire_realtime_911.json" in filenames
+    assert "seattle_spd_call_data.json" in filenames
+    assert "wsdot_road_alerts.json" in filenames
+    assert "usgs_earthquakes_day.geojson" in filenames
+    assert "nws_active_alerts.json" in filenames
+    assert "wsf_ferry_vessels.json" in filenames
+
+
+def test_live_source_collector_atomic_write(tmp_path, monkeypatch):
+    """Test that LiveSourceCollector fetches and writes files atomically."""
+    import io
+    import urllib.request
+    from infraimpact.sources.collector import LiveSourceCollector, SourceEndpoint
+
+    sample_json = json.dumps([{"incident_number": "F100", "type": "Fire"}]).encode()
+
+    class DummyResponse:
+        def __init__(self, data):
+            self.data = data
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def mock_urlopen(req, *args, **kwargs):
+        return DummyResponse(sample_json)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    target_dir = tmp_path / "live_feeds"
+    endpoint = SourceEndpoint(
+        source_id="test_fire",
+        url="https://example.com/fire.json",
+        target_filename="seattle_fire_realtime_911.json",
+        feed_format="json",
+    )
+
+    collector = LiveSourceCollector(target_dir=target_dir, endpoints=[endpoint])
+    records, size, err = collector._fetch_endpoint_sync(endpoint)
+
+    assert err is None
+    assert records == 1
+    assert size == len(sample_json)
+
+    dest_file = target_dir / "seattle_fire_realtime_911.json"
+    assert dest_file.exists()
+    assert not (target_dir / "seattle_fire_realtime_911.json.tmp").exists()
+    loaded = json.loads(dest_file.read_text())
+    assert loaded[0]["incident_number"] == "F100"
+
+
+def test_live_source_collector_rss_parsing(tmp_path, monkeypatch):
+    """Test RSS feed parsing and conversion to JSON news structure."""
+    import urllib.request
+    from infraimpact.sources.collector import LiveSourceCollector, SourceEndpoint
+
+    sample_rss = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <title>Blotter</title>
+        <item>
+          <title>Collision on I-5</title>
+          <link>https://example.com/item1</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <description>Two lanes blocked</description>
+        </item>
+      </channel>
+    </rss>"""
+
+    class DummyResponse:
+        def __init__(self, data):
+            self.data = data
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, *args, **kwargs: DummyResponse(sample_rss))
+
+    target_dir = tmp_path / "live_feeds"
+    endpoint = SourceEndpoint(
+        source_id="test_rss",
+        url="https://example.com/rss",
+        target_filename="spd_blotter.json",
+        feed_format="rss",
+    )
+
+    collector = LiveSourceCollector(target_dir=target_dir, endpoints=[endpoint])
+    records, size, err = collector._fetch_endpoint_sync(endpoint)
+
+    assert err is None
+    assert records == 1
+    dest = target_dir / "spd_blotter.json"
+    assert dest.exists()
+    articles = json.loads(dest.read_text())
+    assert articles[0]["title"] == "Collision on I-5"
+    assert articles[0]["link"] == "https://example.com/item1"

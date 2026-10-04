@@ -457,25 +457,42 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     sources = len(runtime.registry)
     realtime = len(runtime.registry.realtime())
+    collector_mode = "active" if getattr(runtime, "collector", None) else "disabled"
     print(_rule("run"))
     print(f"  region      {runtime.region.region_id}")
     print(f"  sources     {sources} registered, {realtime} realtime (may notify)")
+    print(f"  collector   {collector_mode} (polling live APIs in background)")
     print(f"  database    {settings.database_url}")
     print(f"  interval    {settings.loop_interval_s}s")
-    print(f"  cycles      {args.cycles or 'until interrupted'}")
+    print(f"  cycles      {args.cycles or 'continuous long-running (autonomous)'}")
+
+    def _print_cycle(res: Any) -> None:
+        print(f"  cycle {res.cycle}: {res.summary()}")
 
     async def drive() -> int:
-        results = await runtime.run_forever(max_cycles=args.cycles)
-        for result in results:
-            print(
-                f"  cycle {result.cycle}: {result.summary()}",
-            )
+        import signal
+
+        loop = asyncio.get_running_loop()
+
+        def _handle_signal() -> None:
+            asyncio.create_task(runtime.stop())
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _handle_signal)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+        try:
+            await runtime.run_forever(max_cycles=args.cycles, on_cycle=_print_cycle)
+        finally:
+            await runtime.stop()
         return 0
 
     try:
         return asyncio.run(drive())
     except KeyboardInterrupt:  # pragma: no cover - interactive
-        print("\ninterrupted")
+        print("\ninterrupted - shutting down cleanly")
         return 130
     finally:
         runtime.repo.close()

@@ -41,11 +41,11 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .analysis.orchestrator import AnalysisOrchestrator, AnalysisOutcome
 from .bus.event_bus import Envelope, EventBus, Topic
-from .config import Settings, get_region, get_settings
+from .config import Settings, get_region, get_settings, workspace_root
 from .delta.engine import compare_user_exposure
 from .domain.enums import NotificationReason, TruthStatus, Urgency
 from .domain.ids import utcnow
@@ -223,6 +223,18 @@ class Runtime:
         self._resolutions: dict[str, Any] = {}
         self._dirty: set[str] = set()
 
+        # Autonomous source collector service (§4-7)
+        self._collector_task: asyncio.Task[None] | None = None
+        self.collector = None
+        if getattr(self.settings, "enable_collector", True):
+            from .sources.collector import LiveSourceCollector
+
+            self.collector = LiveSourceCollector(
+                target_dir=workspace_root() / "live_feeds",
+                interval_s=self.settings.collector_interval_s,
+                timeout_s=self.settings.collector_timeout_s,
+            )
+
     # -- lifecycle --------------------------------------------------------
 
     async def _ensure_started(self) -> None:
@@ -248,17 +260,37 @@ class Runtime:
             except Exception as exc:  # noqa: BLE001
                 log.debug("could not auto-seed users: %r", exc)
 
+        # Autonomous continuous collection: start background source collector
+        if self.collector is not None and (self._collector_task is None or self._collector_task.done()):
+            self._collector_task = asyncio.create_task(
+                self.collector.run_forever(), name="live-source-collector"
+            )
+            log.info("autonomous background source collector started")
+
         log.info(
-            "runtime started: region=%s sources=%d tz=%s",
+            "runtime started: region=%s sources=%d collector=%s tz=%s",
             self.region.region_id,
             len(self.registry),
+            "active" if self.collector is not None else "disabled",
             self.region.timezone,
         )
 
     async def stop(self) -> None:
         self._stopping.set()
+        if self.collector is not None:
+            await self.collector.stop()
+        if self._collector_task is not None:
+            self._collector_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._collector_task
+            self._collector_task = None
+        log.info("runtime stopped cleanly")
 
-    async def run_forever(self, max_cycles: int | None = None) -> list[CycleResult]:
+    async def run_forever(
+        self,
+        max_cycles: int | None = None,
+        on_cycle: Callable[[CycleResult], None] | None = None,
+    ) -> list[CycleResult]:
         """Run the loop until stopped. ``max_cycles`` bounds it for tests."""
         await self.start()
         results: list[CycleResult] = []
@@ -266,13 +298,24 @@ class Runtime:
             while not self._stopping.is_set():
                 if max_cycles is not None and len(results) >= max_cycles:
                     break
-                results.append(await self.cycle())
+                cycle_result = await self.cycle()
+                results.append(cycle_result)
+                if max_cycles is None and len(results) > 100:
+                    results.pop(0)
+                if on_cycle is not None:
+                    try:
+                        on_cycle(cycle_result)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("on_cycle callback error: %r", exc)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
                         self._stopping.wait(), timeout=self.settings.loop_interval_s
                     )
         except asyncio.CancelledError:  # pragma: no cover - shutdown path
             log.info("runtime cancelled")
+        finally:
+            if max_cycles is not None:
+                await self.stop()
         return results
 
     # -- one pass ---------------------------------------------------------

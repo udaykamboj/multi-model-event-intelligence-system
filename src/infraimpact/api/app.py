@@ -151,12 +151,31 @@ def create_app(
             log.exception("healthz probe failed")
             healthy = False
             counts["error"] = repr(exc)
+        runtime = getattr(app.state, "runtime", None)
+        collector_active = (
+            runtime.collector.is_running()
+            if runtime and getattr(runtime, "collector", None)
+            else False
+        )
+        loop_active = (
+            not runtime._stopping.is_set()
+            if runtime and hasattr(runtime, "_stopping")
+            else False
+        )
+        cycle_count = getattr(runtime, "_cycle", 0) if runtime else 0
+
         return JSONResponse(
             status_code=200 if healthy else 503,
             content={
                 "status": "ok" if healthy else "degraded",
                 "schema_version": SCHEMA_VERSION,
                 "region_id": app.state.region_id,
+                "autonomous_runtime": {
+                    "loop_active": loop_active,
+                    "collector_active": collector_active,
+                    "cycle_count": cycle_count,
+                    "last_cycle": app.state.last_cycle,
+                },
                 "counts": counts,
             },
         )
@@ -166,10 +185,20 @@ def create_app(
 
 async def _loop_supervisor(runtime: Any, app: FastAPI) -> None:
     """Run the section 71 loop, recording the last cycle for the status route."""
+    log.info("autonomous runtime loop supervisor active")
     while not runtime._stopping.is_set():
         try:
             result = await runtime.cycle()
             app.state.last_cycle = result.summary()
+            if result.persisted > 0 or result.events:
+                log.info(
+                    "autonomous cycle %d: new=%d dirty_events=%d analyses=%d notifications=%d",
+                    result.cycle,
+                    result.persisted,
+                    len(result.events),
+                    result.analyses,
+                    result.notifications,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the loop must survive a bad cycle

@@ -8,6 +8,7 @@ region profile selects adapters and datasets.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,12 @@ class Settings:
     region_id: str = _env("INFRAIMPACT_REGION", "puget-sound")
     loop_interval_s: float = _env_float("INFRAIMPACT_LOOP_INTERVAL_S", 2.0)
     poll_interval_s: float = _env_float("INFRAIMPACT_POLL_INTERVAL_S", 5.0)
+    enable_collector: bool = _env_bool(
+        "INFRAIMPACT_ENABLE_COLLECTOR",
+        "pytest" not in sys.modules and _env("INFRAIMPACT_ENV", "local") != "test",
+    )
+    collector_interval_s: float = _env_float("INFRAIMPACT_COLLECTOR_INTERVAL_S", 60.0)
+    collector_timeout_s: float = _env_float("INFRAIMPACT_COLLECTOR_TIMEOUT_S", 15.0)
     event_ttl_hours: float = _env_float("INFRAIMPACT_EVENT_TTL_HOURS", 12.0)
     resolver_time_window_min: float = _env_float("INFRAIMPACT_RESOLVER_WINDOW_MIN", 180.0)
     resolver_search_radius_m: float = _env_float("INFRAIMPACT_RESOLVER_RADIUS_M", 2500.0)
