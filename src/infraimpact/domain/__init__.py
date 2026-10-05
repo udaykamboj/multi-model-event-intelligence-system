@@ -14,7 +14,7 @@ from .enums import (
     TruthStatus,
     Urgency,
 )
-from .geo import Geometry
+from .geo import Geometry, SpatialIndex
 from .schemas import (
     SCHEMA_VERSION,
     AffectedInfrastructure,
@@ -81,6 +81,7 @@ __all__ = [
     "SavedPlace",
     "SourceHealth",
     "SourceType",
+    "SpatialIndex",
     "StateDelta",
     "TruthStatus",
     "Urgency",

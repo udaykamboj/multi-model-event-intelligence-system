@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from ..domain.enums import EdgeKind, InfrastructureDomain, NodeClass
-from ..domain.geo import Geometry, distance_m, intersects
+from ..domain.geo import Geometry, SpatialIndex, distance_m, intersects
 from ..domain.schemas import GraphEdge, GraphNode
 
 
@@ -44,6 +44,16 @@ class InfrastructureGraph:
         self._in: dict[str, list[str]] = defaultdict(list)
         self._out_edges: dict[str, list[str]] = defaultdict(list)
         self._in_edges: dict[str, list[str]] = defaultdict(list)
+        self._spatial_index: SpatialIndex[GraphNode] | None = None
+        self._spatial_dirty: bool = True
+
+    def _get_spatial_index(self) -> SpatialIndex[GraphNode]:
+        if self._spatial_dirty or self._spatial_index is None:
+            self._spatial_index = SpatialIndex(
+                (n.node_id, n.geometry, n) for n in self.nodes.values() if n.geometry
+            )
+            self._spatial_dirty = False
+        return self._spatial_index
 
     # -- construction ------------------------------------------------------
 
@@ -53,6 +63,7 @@ class InfrastructureGraph:
         self._in.setdefault(node.node_id, [])
         self._out_edges.setdefault(node.node_id, [])
         self._in_edges.setdefault(node.node_id, [])
+        self._spatial_dirty = True
         return node
 
     def add_edge(self, edge: GraphEdge) -> GraphEdge:
@@ -91,27 +102,24 @@ class InfrastructureGraph:
     def nodes_near(
         self, geometry: Geometry | None, radius_m: float, node_classes: Sequence[NodeClass] | None = None
     ) -> list[GraphNode]:
-        out = []
-        for node in self.nodes.values():
-            if node_classes and node.node_class not in node_classes:
-                continue
-            d = distance_m(node.geometry, geometry)
-            if d <= radius_m:
-                out.append(node)
-        return out
+        if not geometry:
+            return []
+        candidates = self._get_spatial_index().query_within_distance(geometry, radius_m)
+        if node_classes:
+            classes_set = set(node_classes)
+            return [n for n in candidates if n.node_class in classes_set]
+        return candidates
 
     def nodes_intersecting(
         self, geometry: Geometry | None, node_classes: Sequence[NodeClass] | None = None
     ) -> list[GraphNode]:
         if geometry is None:
             return []
-        return [
-            node
-            for node in self.nodes.values()
-            if (not node_classes or node.node_class in node_classes)
-            and node.geometry is not None
-            and intersects(node.geometry, geometry)
-        ]
+        candidates = self._get_spatial_index().query_intersects(geometry)
+        if node_classes:
+            classes_set = set(node_classes)
+            return [n for n in candidates if n.node_class in classes_set]
+        return candidates
 
     def propagate(
         self,

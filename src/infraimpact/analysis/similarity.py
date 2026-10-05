@@ -14,6 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+
 from ..domain.enums import CapabilityTier, InfrastructureDomain, ObservationType
 from ..domain.geo import centroid_of, distance_m
 from ..domain.schemas import FeatureValue
@@ -154,11 +157,55 @@ PUGET_SOUND_HISTORICAL_LIBRARY: tuple[dict[str, Any], ...] = (
 )
 
 
+FEATURE_WEIGHTS = np.array([0.25, 0.15, 0.25, 0.15, 0.10, 0.10], dtype=float)
+
+
+def _extract_feature_vector(
+    crowd: float, duration: float, arterial: float, transit: float, moving: float, rush: float
+) -> np.ndarray:
+    return np.array(
+        [
+            math.log1p(max(0.0, crowd)) / 10.0,
+            min(1.0, max(0.0, duration) / 6.0),
+            min(1.0, max(0.0, arterial) / 4.0),
+            min(1.0, max(0.0, transit) / 4.0),
+            1.0 if moving else 0.0,
+            1.0 if rush else 0.0,
+        ],
+        dtype=float,
+    )
+
+
 class HistoricalSimilarityEngine:
-    """Computes hybrid structured + spatial similarity against historical analogues."""
+    """Computes hybrid structured + spatial similarity against historical analogues.
+
+    Uses scikit-learn's NearestNeighbors (L1 metric) over weighted multi-dimensional
+    feature embeddings to retrieve historical state analogues.
+    """
 
     def __init__(self, historical_records: Sequence[dict[str, Any]] | None = None) -> None:
         self.records = list(historical_records or PUGET_SOUND_HISTORICAL_LIBRARY)
+        self._nn: NearestNeighbors | None = None
+        self._build_index()
+
+    def _build_index(self) -> None:
+        if not self.records:
+            self._nn = None
+            return
+        vectors = []
+        for r in self.records:
+            vec = _extract_feature_vector(
+                crowd=float(r.get("crowd_estimate", 0.0) or 0.0),
+                duration=float(r.get("duration_hours", 0.0) or 0.0),
+                arterial=float(r.get("arterial_count", 0.0) or 0.0),
+                transit=float(r.get("transit_routes", 0.0) or 0.0),
+                moving=float(r.get("moving", 0.0) or 0.0),
+                rush=float(r.get("rush_hour", 0.0) or 0.0),
+            )
+            vectors.append(vec * FEATURE_WEIGHTS)
+        matrix = np.array(vectors, dtype=float)
+        self._nn = NearestNeighbors(n_neighbors=len(self.records), metric="l1")
+        self._nn.fit(matrix)
 
     def find_analogues(
         self,
@@ -166,50 +213,36 @@ class HistoricalSimilarityEngine:
         centroid: tuple[float, float] | None,
         top_k: int = 3,
     ) -> list[HistoricalAnalogue]:
-        """Find the top-k most similar historical events."""
-        if not self.records:
+        """Find the top-k most similar historical events using NearestNeighbors and spatial proximity."""
+        if not self.records or self._nn is None:
             return []
 
+        target_vec = _extract_feature_vector(
+            crowd=float(target_features.get("crowd_estimate", 0.0) or 0.0),
+            duration=float(target_features.get("duration_hours", 0.0) or 0.0),
+            arterial=float(target_features.get("arterial_overlap_count", 0.0) or 0.0),
+            transit=float(target_features.get("transit_route_overlap", 0.0) or 0.0),
+            moving=float(target_features.get("moving", 0.0) or 0.0),
+            rush=float(target_features.get("rush_hour", 0.0) or 0.0),
+        )
+        weighted_target = (target_vec * FEATURE_WEIGHTS).reshape(1, -1)
+
+        distances, indices = self._nn.kneighbors(weighted_target)
+
         scored: list[tuple[float, dict[str, Any]]] = []
+        for dist, idx in zip(distances[0], indices[0], strict=False):
+            rec = self.records[idx]
+            feature_sim = max(0.0, 1.0 - float(dist))
 
-        target_crowd = float(target_features.get("crowd_estimate", 0.0) or 0.0)
-        target_duration = float(target_features.get("duration_hours", 0.0) or 0.0)
-        target_arterial = float(target_features.get("arterial_overlap_count", 0.0) or 0.0)
-        target_transit = float(target_features.get("transit_route_overlap", 0.0) or 0.0)
-        target_moving = float(target_features.get("moving", 0.0) or 0.0)
-        target_rush = float(target_features.get("rush_hour", 0.0) or 0.0)
-
-        for rec in self.records:
-            # 1. Feature vector distance:
-            # Normalized differences in key dimensions
-            d_crowd = abs(math.log1p(target_crowd) - math.log1p(rec.get("crowd_estimate", 0))) / 10.0
-            d_dur = min(1.0, abs(target_duration - rec.get("duration_hours", 0.0)) / 6.0)
-            d_art = min(1.0, abs(target_arterial - rec.get("arterial_count", 0.0)) / 4.0)
-            d_trans = min(1.0, abs(target_transit - rec.get("transit_routes", 0.0)) / 4.0)
-            d_move = abs(target_moving - rec.get("moving", 0.0))
-            d_rush = abs(target_rush - rec.get("rush_hour", 0.0))
-
-            feature_dist = (
-                0.25 * d_crowd
-                + 0.15 * d_dur
-                + 0.25 * d_art
-                + 0.15 * d_trans
-                + 0.10 * d_move
-                + 0.10 * d_rush
-            )
-            feature_sim = max(0.0, 1.0 - feature_dist)
-
-            # 2. Spatial proximity:
+            # Spatial proximity
             spatial_sim = 0.5
             rec_centroid = rec.get("centroid")
             if centroid and rec_centroid:
-                # distance in km
                 p1 = {"type": "Point", "coordinates": [centroid[0], centroid[1]]}
                 p2 = {"type": "Point", "coordinates": [rec_centroid[0], rec_centroid[1]]}
                 dist_km = distance_m(p1, p2) / 1000.0
                 spatial_sim = max(0.0, 1.0 - min(1.0, dist_km / 15.0))
 
-            # Composite similarity (70% features, 30% spatial location)
             composite_sim = 0.70 * feature_sim + 0.30 * spatial_sim
             scored.append((composite_sim, rec))
 

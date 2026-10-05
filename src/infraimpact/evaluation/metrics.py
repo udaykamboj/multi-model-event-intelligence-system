@@ -51,14 +51,21 @@ class EvaluationReport:
 
 
 def compute_brier_score(predictions: Sequence[float], ground_truth: Sequence[int | bool | float]) -> float:
-    """Calculate mean squared difference between predicted probability and binary outcome.
+    """Calculate mean squared difference between predicted probability and binary outcome via scikit-learn.
 
     Brier score = (1/N) * sum((p_i - y_i)^2). Lower is better (0 is perfect).
     """
     if not predictions or len(predictions) != len(ground_truth):
         return 0.0
-    total = sum((float(p) - float(y)) ** 2 for p, y in zip(predictions, ground_truth, strict=False))
-    return round(total / len(predictions), 4)
+    y_true = [int(bool(y)) if isinstance(y, (bool, int)) else float(y) for y in ground_truth]
+    y_prob = [float(p) for p in predictions]
+    try:
+        from sklearn.metrics import brier_score_loss
+
+        return round(float(brier_score_loss(y_true, y_prob)), 4)
+    except Exception:
+        total = sum((float(p) - float(y)) ** 2 for p, y in zip(y_prob, y_true, strict=False))
+        return round(total / len(predictions), 4)
 
 
 def compute_expected_calibration_error(
@@ -89,32 +96,28 @@ def compute_expected_calibration_error(
 def compute_classification_metrics(
     predictions: Sequence[float], ground_truth: Sequence[int | bool | float], threshold: float = 0.5
 ) -> dict[str, float]:
-    """Precision, recall, F1, false alert rate, missed impact rate."""
+    """Precision, recall, F1, false alert rate, missed impact rate using scikit-learn."""
     if not predictions or len(predictions) != len(ground_truth):
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "false_alert_rate": 0.0, "missed_impact_rate": 0.0}
 
-    tp = fp = fn = tn = 0
-    for p, y in zip(predictions, ground_truth, strict=False):
-        pred_bool = p >= threshold
-        true_bool = bool(y)
-        if pred_bool and true_bool:
-            tp += 1
-        elif pred_bool and not true_bool:
-            fp += 1
-        elif not pred_bool and true_bool:
-            fn += 1
-        else:
-            tn += 1
+    y_true = [1 if bool(y) else 0 for y in ground_truth]
+    y_pred = [1 if float(p) >= threshold else 0 for p in predictions]
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
+
+    prec = float(precision_score(y_true, y_pred, zero_division=0.0))
+    rec = float(recall_score(y_true, y_pred, zero_division=0.0))
+    f1 = float(f1_score(y_true, y_pred, zero_division=0.0))
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
     false_alert_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     missed_impact_rate = fn / (tp + fn) if (tp + fn) > 0 else 0.0
 
     return {
-        "precision": round(precision, 4),
-        "recall": round(recall, 4),
+        "precision": round(prec, 4),
+        "recall": round(rec, 4),
         "f1": round(f1, 4),
         "false_alert_rate": round(false_alert_rate, 4),
         "missed_impact_rate": round(missed_impact_rate, 4),
@@ -124,13 +127,14 @@ def compute_classification_metrics(
 def compute_regression_metrics(
     predictions: Sequence[float], ground_truth: Sequence[float]
 ) -> dict[str, float]:
-    """Mean Absolute Error (MAE) and Root Mean Squared Error (RMSE)."""
+    """Mean Absolute Error (MAE) and Root Mean Squared Error (RMSE) via scikit-learn."""
     if not predictions or len(predictions) != len(ground_truth):
         return {"mae": 0.0, "rmse": 0.0}
 
-    n = len(predictions)
-    mae = sum(abs(p - y) for p, y in zip(predictions, ground_truth, strict=False)) / n
-    rmse = math.sqrt(sum((p - y) ** 2 for p, y in zip(predictions, ground_truth, strict=False)) / n)
+    from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+
+    mae = float(mean_absolute_error(ground_truth, predictions))
+    rmse = float(root_mean_squared_error(ground_truth, predictions))
     return {"mae": round(mae, 4), "rmse": round(rmse, 4)}
 
 

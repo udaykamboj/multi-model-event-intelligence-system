@@ -19,7 +19,7 @@ from typing import Any, Sequence
 
 from ..delta.engine import has_official_guidance, truth_confidence
 from ..domain.enums import InfrastructureDomain, TruthStatus, Urgency
-from ..domain.geo import contains, distance_m, intersects
+from ..domain.geo import SpatialIndex, contains, distance_m, intersects
 from ..domain.ids import utcnow
 from ..domain.schemas import (
     AffectedInfrastructure,
@@ -81,14 +81,17 @@ class ExposureEngine:
 
     def compute(self, ctx: ExposureContext) -> UserExposure:
         user = ctx.user
+        impacts_index = SpatialIndex(
+            (imp.identifier, imp.geometry, imp) for imp in ctx.impacts if imp.geometry
+        )
         route_impacts = tuple(
-            self._route_impact(route, ctx) for route in user.route_profiles
+            self._route_impact(route, ctx, impacts_index) for route in user.route_profiles
         )
         route_impacts = tuple(r for r in route_impacts if r.intersects)
 
         place_impacts = {
             place.place_id: round(
-                self._place_exposure(place, ctx),
+                self._place_exposure(place, ctx, impacts_index),
                 4,
             )
             for place in user.saved_places
@@ -137,12 +140,25 @@ class ExposureEngine:
 
     # -- routes -----------------------------------------------------------
 
-    def _route_impact(self, route: RouteProfile, ctx: ExposureContext) -> RouteImpact:
+    def _route_impact(
+        self,
+        route: RouteProfile,
+        ctx: ExposureContext,
+        impacts_index: SpatialIndex[AffectedInfrastructure] | None = None,
+    ) -> RouteImpact:
         blocked: list[str] = []
         distances: list[float] = []
         modes = set(route.modes)
 
-        for impact in ctx.impacts:
+        if impacts_index is not None and route.geometry:
+            candidates = impacts_index.query_within_distance(route.geometry, ROUTE_BLOCKED_M)
+            intersecting = impacts_index.query_intersects(route.geometry)
+            candidate_map = {c.identifier: c for c in candidates + intersecting}
+            impact_list = list(candidate_map.values())
+        else:
+            impact_list = list(ctx.impacts)
+
+        for impact in impact_list:
             if not impact.geometry:
                 continue
             if not _mode_matches(impact, modes, ctx):
@@ -235,13 +251,29 @@ class ExposureEngine:
 
     # -- saved places -----------------------------------------------------
 
-    def _place_exposure(self, place: SavedPlace, ctx: ExposureContext) -> float:
+    def _place_exposure(
+        self,
+        place: SavedPlace,
+        ctx: ExposureContext,
+        impacts_index: SpatialIndex[AffectedInfrastructure] | None = None,
+    ) -> float:
         """How exposed a saved place is, in 0..1."""
         if place.geometry and ctx.state.geometry and contains(ctx.state.geometry, _centre(place.geometry)):
             return 1.0
 
+        if not place.geometry:
+            return 0.0
+
+        if impacts_index is not None:
+            candidates = impacts_index.query_within_distance(place.geometry, EXPOSURE_RADIUS_M)
+            if not candidates:
+                return 0.0
+            relevant_impacts = candidates
+        else:
+            relevant_impacts = [i for i in ctx.impacts if i.geometry]
+
         nearest = min(
-            (distance_m(place.geometry, i.geometry) for i in ctx.impacts if i.geometry),
+            (distance_m(place.geometry, i.geometry) for i in relevant_impacts if i.geometry),
             default=float("inf"),
         )
         if nearest > EXPOSURE_RADIUS_M:
@@ -251,7 +283,7 @@ class ExposureEngine:
         domain_score = max(
             (
                 _SEVERITY_SCORE[i.severity]
-                for i in ctx.impacts
+                for i in relevant_impacts
                 if i.geometry and distance_m(place.geometry, i.geometry) <= EXPOSURE_RADIUS_M
             ),
             default=0.0,
@@ -259,7 +291,7 @@ class ExposureEngine:
         predicted = max(
             (
                 ctx.peak_probability(i.domain)
-                for i in ctx.impacts
+                for i in relevant_impacts
                 if i.geometry and distance_m(place.geometry, i.geometry) <= EXPOSURE_RADIUS_M
             ),
             default=0.0,

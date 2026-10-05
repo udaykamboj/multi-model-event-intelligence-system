@@ -230,3 +230,198 @@ class TestShapelyGEOSIntelligence:
         far_road = line((-122.400, 47.608), (-122.405, 47.608))
         assert intersects(far_road, buffered) is False
         assert distance_m(far_road, buffered) > 4000.0
+
+
+# ============================================================================
+# 4. Shapely STRtree Spatial Indexing
+# ============================================================================
+
+
+class TestSTRtreeSpatialIndexing:
+    def test_spatial_index_intersects_and_distance(self):
+        from infraimpact.domain.geo import SpatialIndex, point, polygon
+
+        idx: SpatialIndex[str] = SpatialIndex()
+        idx.insert("p1", point(-122.335, 47.608), "downtown_seattle")
+        idx.insert("p2", point(-122.315, 47.615), "capitol_hill")
+        idx.insert("p3", point(-122.120, 47.674), "redmond")
+
+        assert len(idx) == 3
+
+        # Intersects query with bounding polygon around downtown
+        downtown_poly = polygon([
+            [-122.340, 47.600],
+            [-122.330, 47.600],
+            [-122.330, 47.615],
+            [-122.340, 47.615],
+            [-122.340, 47.600],
+        ])
+        results = idx.query_intersects(downtown_poly)
+        assert results == ["downtown_seattle"]
+
+        # Within distance query (3000m from downtown should include downtown & capitol hill, but not redmond)
+        near = idx.query_within_distance(point(-122.335, 47.608), radius_m=3000.0)
+        assert "downtown_seattle" in near
+        assert "capitol_hill" in near
+        assert "redmond" not in near
+
+        # Nearest neighbor query
+        nearest = idx.query_nearest(point(-122.125, 47.670))
+        assert nearest == "redmond"
+
+    def test_graph_uses_spatial_index_for_fast_queries(self):
+        graph = build_puget_sound_graph()
+        p = point(-122.335, 47.608)
+
+        # Query nodes near downtown Seattle
+        near_nodes = graph.nodes_near(p, radius_m=800.0)
+        assert len(near_nodes) >= 3
+        assert all(distance_m(n.geometry, p) <= 800.0 for n in near_nodes)
+
+        # Nodes intersecting
+        downtown_poly = buffer_geometry(p, 300.0)
+        intersecting = graph.nodes_intersecting(downtown_poly)
+        assert len(intersecting) >= 1
+        assert all(intersects(n.geometry, downtown_poly) for n in intersecting)
+
+
+# ============================================================================
+# 5. Scikit-Learn Historical NearestNeighbors
+# ============================================================================
+
+
+class TestHistoricalNearestNeighbors:
+    def test_nearest_neighbors_retrieval(self):
+        from infraimpact.analysis.similarity import HistoricalSimilarityEngine
+
+        engine = HistoricalSimilarityEngine()
+        analogues = engine.find_analogues(
+            target_features={
+                "crowd_estimate": 1500,
+                "duration_hours": 4.0,
+                "arterial_overlap_count": 2,
+                "transit_route_overlap": 4,
+                "moving": 1.0,
+                "rush_hour": 1.0,
+            },
+            centroid=(-122.3370, 47.6115),
+            top_k=2,
+        )
+
+        assert len(analogues) == 2
+        # Downtown Seattle 2020 Westlake demonstration is the exact closest match
+        assert analogues[0].event_id == "hist_sea_2020_0530"
+        assert analogues[0].similarity_score > 0.85
+        assert len(analogues[0].observed_trajectory) >= 2
+
+
+# ============================================================================
+# 6. Bayesian Evidence Fusion & Source Reliability
+# ============================================================================
+
+
+class TestBayesianEvidenceIntelligence:
+    def test_bayesian_tracker_updating(self):
+        from infraimpact.analysis.uncertainty import BayesianSourceReliabilityTracker
+
+        tracker = BayesianSourceReliabilityTracker()
+        # Official source baseline reliability
+        r_init = tracker.expected_reliability("wsdot.alerts", Authority.OFFICIAL)
+        assert r_init >= 0.90
+
+        # Unverified source baseline
+        r_unv = tracker.expected_reliability("social.anon", Authority.UNVERIFIED)
+        assert r_unv < 0.50
+
+        # Register confirmations
+        tracker.register_observation("social.anon", Authority.UNVERIFIED, confirmed=True, weight=10.0)
+        r_updated = tracker.expected_reliability("social.anon", Authority.UNVERIFIED)
+        assert r_updated > r_unv
+
+    def test_bayesian_evidence_fusion_probabilities(self):
+        from infraimpact.analysis.uncertainty import fuse_evidence_probabilities
+
+        # Single moderate source -> slight increase
+        single = fuse_evidence_probabilities([(True, 0.70)], prior_probability=0.5)
+        assert 0.65 < single < 0.75
+
+        # Three independent reliable sources confirming -> high confidence
+        corroborated = fuse_evidence_probabilities(
+            [(True, 0.85), (True, 0.80), (True, 0.90)], prior_probability=0.5
+        )
+        assert corroborated > 0.95
+
+        # Contradicted by authoritative source
+        conflicted = fuse_evidence_probabilities(
+            [(True, 0.60), (False, 0.90)], prior_probability=0.5
+        )
+        assert conflicted < 0.25
+
+
+# ============================================================================
+# 7. DBSCAN Spatiotemporal Observation Clustering
+# ============================================================================
+
+
+class TestDBSCANSpatiotemporalClustering:
+    def test_cluster_burst_observations(self):
+        from infraimpact.events.resolver import cluster_unresolved_observations
+
+        t0 = datetime.fromisoformat("2026-10-04T12:00:00+00:00")
+        t_soon = t0 + timedelta(minutes=5)
+        t_later = t0 + timedelta(hours=8)
+
+        # Three observations in downtown Seattle within 5 minutes
+        obs1 = Observation(
+            observation_id="c_obs_1",
+            source_id="news.1",
+            source_record_id="r1",
+            source_type=SourceType.ESTABLISHED_NEWS,
+            observation_type=ObservationType.PUBLIC_GATHERING_REPORT,
+            observed_at=t0,
+            ingested_at=t0,
+            event_time=t0,
+            geometry=point(-122.335, 47.608),
+            provenance=Provenance(authority=Authority.ESTABLISHED_MEDIA, content_hash="h1"),
+            quality=ObservationQuality(source_reliability=0.8),
+        )
+        obs2 = Observation(
+            observation_id="c_obs_2",
+            source_id="police.cad",
+            source_record_id="r2",
+            source_type=SourceType.OFFICIAL_MACHINE_READABLE,
+            observation_type=ObservationType.POLICE_RESPONSE,
+            observed_at=t_soon,
+            ingested_at=t_soon,
+            event_time=t_soon,
+            geometry=point(-122.336, 47.609),
+            provenance=Provenance(authority=Authority.OFFICIAL, content_hash="h2"),
+            quality=ObservationQuality(source_reliability=0.9),
+        )
+        # One observation 20 km away in Bellevue
+        obs3 = Observation(
+            observation_id="c_obs_3",
+            source_id="wsdot.east",
+            source_record_id="r3",
+            source_type=SourceType.OFFICIAL_MACHINE_READABLE,
+            observation_type=ObservationType.ROAD_CLOSURE,
+            observed_at=t0,
+            ingested_at=t0,
+            event_time=t0,
+            geometry=point(-122.190, 47.610),
+            provenance=Provenance(authority=Authority.OFFICIAL, content_hash="h3"),
+            quality=ObservationQuality(source_reliability=0.9),
+        )
+
+        clusters = cluster_unresolved_observations([obs1, obs2, obs3], eps_m=1000.0)
+        assert len(clusters) == 2
+
+        # Cluster 0 should contain obs1 and obs2 together
+        downtown_cluster = next(c for c in clusters if len(c.observations) == 2)
+        assert {"c_obs_1", "c_obs_2"} == {o.observation_id for o in downtown_cluster.observations}
+        assert downtown_cluster.centroid is not None
+        assert abs(downtown_cluster.centroid[0] - (-122.3355)) < 0.01
+
+        # Cluster 1 contains the distant Bellevue observation
+        bellevue_cluster = next(c for c in clusters if len(c.observations) == 1)
+        assert bellevue_cluster.observations[0].observation_id == "c_obs_3"

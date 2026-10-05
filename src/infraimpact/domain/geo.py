@@ -17,8 +17,9 @@ Geometry representation is GeoJSON-shaped, not a bespoke class:
 from __future__ import annotations
 
 import math
-from typing import Any, Iterable, Sequence
+from typing import Any, Generic, Iterable, Sequence, TypeVar
 
+from shapely import STRtree
 from shapely.geometry import Point as _SPoint, mapping as _mapping, shape as _shape
 from shapely.ops import transform as _transform
 
@@ -244,3 +245,135 @@ def _lists(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _lists(v) for k, v in obj.items()}
     return obj
+
+
+# --------------------------------------------------------------------------
+# spatial indexing (shapely.STRtree / GEOS C-backed)
+# --------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class SpatialIndex(Generic[T]):
+    """GEOS C-backed R-tree spatial index using shapely.STRtree.
+
+    Provides O(log N) bounding-box queries, spatial predicate filtering
+    (intersects, within distance), and nearest-neighbor lookups for arbitrary
+    items tagged with GeoJSON geometries.
+    """
+
+    def __init__(self, items: Iterable[tuple[str, Geometry, T]] | None = None) -> None:
+        self._items: list[tuple[str, Geometry, T]] = []
+        self._geoms: list[Any] = []
+        self._id_to_idx: dict[str, int] = {}
+        self._tree: STRtree | None = None
+        self._dirty: bool = False
+        if items:
+            for item_id, geom, payload in items:
+                self.insert(item_id, geom, payload)
+
+    def insert(self, item_id: str, geometry: Geometry | None, payload: T) -> None:
+        """Insert an item with its GeoJSON geometry into the index."""
+        if not geometry:
+            return
+        try:
+            s_geom = _shape(geometry)
+            if s_geom.is_empty:
+                return
+            idx = len(self._items)
+            self._items.append((item_id, geometry, payload))
+            self._geoms.append(s_geom)
+            self._id_to_idx[item_id] = idx
+            self._dirty = True
+        except Exception:
+            return
+
+    def _ensure_tree(self) -> STRtree | None:
+        if self._dirty or self._tree is None:
+            if self._geoms:
+                self._tree = STRtree(self._geoms)
+            else:
+                self._tree = None
+            self._dirty = False
+        return self._tree
+
+    def query_intersects(self, geometry: Geometry | None) -> list[T]:
+        """Return payloads of items whose geometry intersects the target geometry."""
+        if not geometry:
+            return []
+        try:
+            target_shape = _shape(geometry)
+            if target_shape.is_empty:
+                return []
+        except Exception:
+            return []
+
+        tree = self._ensure_tree()
+        if tree is None:
+            return []
+
+        candidate_indices = tree.query(target_shape, predicate="intersects")
+        results: list[T] = []
+        for idx in candidate_indices:
+            _, item_geom, payload = self._items[int(idx)]
+            if intersects(item_geom, geometry):
+                results.append(payload)
+        return results
+
+    def query_within_distance(self, geometry: Geometry | None, radius_m: float) -> list[T]:
+        """Return payloads of items within radius_m of the target geometry."""
+        if not geometry or radius_m < 0:
+            return []
+        tree = self._ensure_tree()
+        if tree is None:
+            return []
+
+        # Degree distance estimate upper bound for candidate pruning
+        lat = _lat0(geometry)
+        deg_m = max(1000.0, EARTH_RADIUS_M * math.pi / 180.0 * math.cos(math.radians(lat)))
+        deg_dist = (radius_m / deg_m) * 1.05 + 0.0001
+
+        try:
+            target_shape = _shape(geometry)
+            if target_shape.is_empty:
+                return []
+            candidate_indices = tree.query(target_shape, predicate="dwithin", distance=deg_dist)
+        except Exception:
+            buffered = buffer_geometry(geometry, radius_m)
+            if not buffered:
+                return []
+            try:
+                b_shape = _shape(buffered)
+                candidate_indices = tree.query(b_shape, predicate="intersects")
+            except Exception:
+                return []
+
+        results: list[T] = []
+        for idx in candidate_indices:
+            _, item_geom, payload = self._items[int(idx)]
+            if distance_m(item_geom, geometry) <= radius_m:
+                results.append(payload)
+        return results
+
+    def query_nearest(self, geometry: Geometry | None) -> T | None:
+        """Return payload of nearest item to target geometry."""
+        if not geometry:
+            return None
+        tree = self._ensure_tree()
+        if tree is None or not self._items:
+            return None
+        try:
+            target_shape = _shape(geometry)
+            if target_shape.is_empty:
+                return None
+            idx = tree.query_nearest(target_shape)
+            if idx is not None:
+                first_idx = int(idx[0]) if hasattr(idx, "__len__") and len(idx) > 0 else int(idx)
+                return self._items[first_idx][2]
+        except Exception:
+            return None
+        return None
+
+    def __len__(self) -> int:
+        return len(self._items)
+

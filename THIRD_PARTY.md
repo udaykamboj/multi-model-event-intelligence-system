@@ -94,6 +94,8 @@ This document records the provenance, licensing, architectural rationale, interf
 
 ---
 
+---
+
 ### 1.5 Lifelines (Survival & Time-to-Event Analysis)
 * **Repository URL:** https://github.com/CamDavidsonPilon/lifelines
 * **Version:** 0.30.3
@@ -109,16 +111,73 @@ This document records the provenance, licensing, architectural rationale, interf
 
 ---
 
+### 1.6 Shapely STRtree (GEOS C-Backed Spatial Indexing)
+* **Repository URL:** https://github.com/shapely/shapely
+* **Version:** 2.1.2
+* **License:** 3-Clause BSD
+* **Component Provided:**
+  * GEOS C-backed Sort-Tile-Recursive (STR) R-Tree spatial index (`shapely.STRtree`).
+  * $O(\log N)$ spatial candidate queries: bounding box intersection (`predicate="intersects"`), distance containment (`predicate="dwithin"`), and nearest-neighbor search (`query_nearest`).
+* **Why Selected:**
+  * Replaces $O(N)$ linear scans across thousands of graph nodes, routes, and infrastructure impacts.
+  * Direct C-GEOS performance without needing a separate C-extension like `libspatialindex`/`rtree`.
+* **What We Modified / Wrapped:**
+  * Created `SpatialIndex[T]` generic class in `src/infraimpact/domain/geo.py`.
+  * Integrated into `InfrastructureGraph` in `src/infraimpact/graph/model.py` for `nodes_near` and `nodes_intersecting`.
+  * Integrated into `ExposureEngine` in `src/infraimpact/users/exposure.py` for route impact and saved-place candidate pruning.
+* **How It Connects to Our Architecture:**
+  * Accelerates all spatial joins between incident footprints and the infrastructure network.
+* **Upstream Update Strategy:** Part of core `shapely>=2.0`.
+
+---
+
+### 1.7 Scikit-Learn (NearestNeighbors, DBSCAN, Evaluation Metrics & Calibration)
+* **Repository URL:** https://github.com/scikit-learn/scikit-learn
+* **Version:** 1.9.1
+* **License:** 3-Clause BSD
+* **Component Provided:**
+  * `sklearn.neighbors.NearestNeighbors`: High-dimensional vector space nearest-neighbor retrieval with Manhattan (L1) and Euclidean distance metrics.
+  * `sklearn.cluster.DBSCAN`: Density-based spatial clustering of applications with noise, using the great-circle `haversine` metric on spherical coordinates.
+  * `sklearn.metrics` & `sklearn.calibration`: Standardized machine learning evaluation metrics (`brier_score_loss`, `precision_score`, `recall_score`, `f1_score`, `mean_absolute_error`, `root_mean_squared_error`, `calibration_curve`).
+* **Why Selected:**
+  * Industry standard, rigorously tested, C/Cython-optimized machine learning primitives.
+  * Avoids custom reimplementation of neighbor retrieval, clustering, calibration, and classification metrics.
+* **What We Modified / Wrapped:**
+  * **Historical Similarity Retrieval:** In `src/infraimpact/analysis/similarity.py`, `HistoricalSimilarityEngine` builds weighted multidimensional feature vectors (crowd size, duration, arterial overlap, transit overlap, mobility, rush hour) and queries top-$k$ historical analogues using `NearestNeighbors(metric="l1")` combined with geodesic spatial proximity.
+  * **Observation Burst Clustering:** In `src/infraimpact/events/resolver.py`, `cluster_unresolved_observations` clusters incoming bursts of multi-source observations using `DBSCAN(metric="haversine")` within sliding temporal windows.
+  * **Evaluation Framework:** In `src/infraimpact/evaluation/metrics.py`, replaces hand-rolled metrics with scikit-learn standard implementations.
+* **Upstream Update Strategy:** PyPI dependency management via `pyproject.toml` (`scikit-learn>=1.5`).
+
+---
+
+### 1.8 Bayesian Evidence Fusion & Source Reliability Tracker
+* **Component Provided:**
+  * Conjugate Beta-Binomial updating model (`BayesianSourceReliabilityTracker`) for dynamic source reliability tracking.
+  * Multi-source log-likelihood ratio updating (`fuse_evidence_probabilities`) for hypothesis testing and evidence fusion.
+* **Why Selected:**
+  * Implements mathematically principled, non-heuristic evidence fusion (Design Platform §36, §37).
+  * Solves the source corroboration and contradiction problem using exact Bayesian odds multiplication rather than ad-hoc heuristics or LLM opinions.
+* **What We Modified / Wrapped:**
+  * Implemented in `src/infraimpact/analysis/uncertainty.py`.
+  * Integrated directly into `SourceConflictCapability` to produce `probabilistic_fusion_score`, `source_reliability_score`, and `information_confidence`.
+* **How It Connects to Our Architecture:**
+  * Feeds the `ConfidenceBreakdown` in `src/infraimpact/analysis/metrics.py` and informs Jev bounded decision thresholds.
+
+---
+
 ## 2. Evaluated Candidate Technologies & Architectural Seams
 
 Per the design guidelines (§2, §3, §13), candidate systems were researched and evaluated. Below are the architectural decisions and designated seams:
 
 | Subsystem Domain | Evaluated Candidates | Selected Implementation / Architectural Seam | Rationale |
 | :--- | :--- | :--- | :--- |
-| **Road Network Routing** | OSRM, Valhalla, GraphHopper, OSMnx, NetworkX | **NetworkX** (In-Memory Engine) + `RoutingProvider` ABC Seam | OSRM and Valhalla require external daemon microservices, multi-gigabyte PBF extracts, and pre-built contraction hierarchies unsuitable for self-contained, in-repo testability. `src/infraimpact/graph/routing.py` defines `RoutingProvider` as an explicit adapter seam to plug in OSRM/Valhalla for production deployments. |
-| **Geospatial Processing** | PostGIS, GeoPandas, GDAL, Shapely / GEOS | **Shapely 2.1 (GEOS)** | Shapely 2.1 provides C-speed GEOS geometry algorithms directly in-process with zero database dependency. Matches PostGIS ST_* function signatures cleanly. |
+| **Road Network Routing** | OSRM, Valhalla, GraphHopper, OSMnx, NetworkX | **NetworkX 3.7** (In-Memory Engine) + `RoutingProvider` ABC Seam | OSRM and Valhalla require external daemon microservices, multi-gigabyte PBF extracts, and pre-built contraction hierarchies unsuitable for self-contained, in-repo testability. `src/infraimpact/graph/routing.py` defines `RoutingProvider` as an explicit adapter seam to plug in OSRM/Valhalla for production deployments. |
+| **Geospatial Processing & Indexing** | PostGIS, GeoPandas, GDAL, Shapely / GEOS | **Shapely 2.1 (GEOS + STRtree)** | Shapely 2.1 provides C-speed GEOS geometry algorithms and STRtree spatial indexing directly in-process with zero database dependency. Matches PostGIS ST_* function signatures cleanly. |
 | **Time-Series Change Detection** | PyOD, River, ADTK, Ruptures | **Ruptures 1.1 (PELT)** | Ruptures is the most reliable, mathematically verified change-point framework with exact PELT optimization. River/PyOD are suited for outlier detection, whereas Ruptures detects state transitions and regime shifts. |
+| **Historical Analogue Retrieval** | Faiss, Annoy, ChromaDB, Scikit-Learn | **Scikit-Learn (NearestNeighbors L1)** | Eliminates external vector database infrastructure. Scikit-learn's `NearestNeighbors` provides deterministic, exact feature matching and spatial indexing without external service overhead. |
+| **Spatiotemporal Observation Clustering** | HDBSCAN, Scikit-learn DBSCAN | **Scikit-Learn DBSCAN (Haversine)** | DBSCAN with haversine metric reliably groups spatial bursts of unverified and multi-source observations into coherent candidate event clusters prior to resolution. |
+| **Probabilistic Evidence Fusion** | Dempster-Shafer, Bayesian Odds, LLM | **Bayesian Conjugate Beta + Log-Odds Fusion** | Strictly adheres to §36 & §37: probabilistic evidence fusion with explicit source reliability tracking rather than subjective LLM consensus. |
 | **GTFS Transit Ingestion** | Partridge, GTFS-Kit, pygtfs | **Domain GTFS Normalizer** + `TransitDisruptionCapability` | Ingests GTFS-RT feed protobufs and static alerts directly into standardized `Observation` records (`TRANSIT_SERVICE_ALERT`, `VEHICLE_POSITION`), avoiding complex relational schema overhead in memory. |
-| **Event Resolution & Clustering** | HDBSCAN, Scikit-learn DBSCAN | **Spatiotemporal Event Resolver** (`src/infraimpact/events/resolver.py`) | Evaluated HDBSCAN. Implemented sliding-window spatiotemporal entity and event resolver that clusters observations across space, time, and semantic claim similarity into persistent `EventState` lifecycles. |
 | **Bounded Decision Layer** | LLM vs. Rule Engine vs. Jev | **Jev Decision Layer** | Strictly adheres to §5 & §6: deterministic algorithms and ML produce structured analytical metrics; Jev provides bounded, explainable decision-making without hallucination risk. |
+
 

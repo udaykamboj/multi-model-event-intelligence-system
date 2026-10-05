@@ -7,11 +7,110 @@ orchestrator can act on it.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Sequence
 
-from ..domain.enums import CapabilityTier, ObservationType
+from ..domain.enums import Authority, CapabilityTier, ObservationType
 from ..domain.schemas import FeatureValue
 from .capabilities import AnalysisCapability, CapabilityContext, CapabilityResult
+
+
+@dataclass
+class BetaPrior:
+    """Beta distribution parameters for source reliability conjugate updating."""
+
+    alpha: float
+    beta: float
+
+    @property
+    def mean(self) -> float:
+        return self.alpha / (self.alpha + self.beta)
+
+    @property
+    def variance(self) -> float:
+        a, b = self.alpha, self.beta
+        return (a * b) / (((a + b) ** 2) * (a + b + 1.0))
+
+
+class BayesianSourceReliabilityTracker:
+    """Tracks Bayesian source reliability using conjugate Beta-Binomial updating (section 37)."""
+
+    DEFAULT_PRIORS: dict[Authority, tuple[float, float]] = {
+        Authority.OFFICIAL: (9.0, 1.0),
+        Authority.SEMI_OFFICIAL: (7.5, 2.5),
+        Authority.ESTABLISHED_MEDIA: (7.0, 3.0),
+        Authority.COMMUNITY: (5.0, 5.0),
+        Authority.UNVERIFIED: (3.0, 5.0),
+        Authority.INTERNAL: (8.0, 2.0),
+    }
+
+    def __init__(self) -> None:
+        self._sources: dict[str, BetaPrior] = {}
+
+    def get_prior(self, authority: Authority | str | None) -> BetaPrior:
+        if isinstance(authority, str):
+            try:
+                auth_enum = Authority(authority)
+            except ValueError:
+                auth_enum = Authority.COMMUNITY
+        elif isinstance(authority, Authority):
+            auth_enum = authority
+        else:
+            auth_enum = Authority.COMMUNITY
+
+        a, b = self.DEFAULT_PRIORS.get(auth_enum, (5.0, 5.0))
+        return BetaPrior(alpha=a, beta=b)
+
+    def register_observation(
+        self,
+        source_id: str,
+        authority: Authority | str | None,
+        confirmed: bool = True,
+        weight: float = 1.0,
+    ) -> None:
+        if source_id not in self._sources:
+            prior = self.get_prior(authority)
+            self._sources[source_id] = BetaPrior(alpha=prior.alpha, beta=prior.beta)
+
+        curr = self._sources[source_id]
+        if confirmed:
+            curr.alpha += weight
+        else:
+            curr.beta += weight
+
+    def expected_reliability(self, source_id: str, authority: Authority | str | None = None) -> float:
+        if source_id in self._sources:
+            return round(self._sources[source_id].mean, 4)
+        return round(self.get_prior(authority).mean, 4)
+
+
+def fuse_evidence_probabilities(
+    reports: Sequence[tuple[bool, float]],
+    prior_probability: float = 0.5,
+) -> float:
+    """Multi-source Bayesian evidence fusion via log-likelihood ratio updating (section 36).
+
+    Given independent reports (affirms_hypothesis: bool, source_reliability: float),
+    computes the posterior belief P(H | E).
+    """
+    if not reports:
+        return prior_probability
+
+    p0 = max(0.01, min(0.99, prior_probability))
+    log_odds = math.log(p0 / (1.0 - p0))
+
+    for affirms, reliability in reports:
+        r = max(0.05, min(0.95, reliability))
+        if affirms:
+            lr = r / (1.0 - r)
+        else:
+            lr = (1.0 - r) / r
+        log_odds += math.log(lr)
+
+    posterior = 1.0 / (1.0 + math.exp(-log_odds))
+    return round(max(0.01, min(0.99, posterior)), 4)
 
 
 class SourceConflictCapability(AnalysisCapability):
@@ -54,6 +153,28 @@ class SourceConflictCapability(AnalysisCapability):
 
         confidence = max(0.05, min(1.0, base_confidence - penalty))
 
+        tracker = BayesianSourceReliabilityTracker()
+        reports: list[tuple[bool, float]] = []
+        for obs in ctx.observations:
+            auth = getattr(obs.provenance, "authority", None)
+            rel = tracker.expected_reliability(obs.source_id, auth)
+            reports.append((True, rel))
+
+        if contradictions:
+            for _ in range(contradictions):
+                reports.append((False, 0.70))
+
+        fusion_prob = fuse_evidence_probabilities(reports, prior_probability=0.5)
+
+        if ctx.observations:
+            reliabilities = [
+                tracker.expected_reliability(o.source_id, getattr(o.provenance, "authority", None))
+                for o in ctx.observations
+            ]
+            bayes_rel = sum(reliabilities) / len(reliabilities)
+        else:
+            bayes_rel = vector.get("source_reliability", authority)
+
         result.features.update(
             {
                 "source_contradictions": FeatureValue(
@@ -62,12 +183,15 @@ class SourceConflictCapability(AnalysisCapability):
                 "information_confidence": FeatureValue(
                     name="information_confidence", value=round(confidence, 4)
                 ),
+                "probabilistic_fusion_score": FeatureValue(
+                    name="probabilistic_fusion_score", value=round(fusion_prob, 4)
+                ),
                 "source_authority_score": FeatureValue(
                     name="source_authority_score", value=round(authority, 4)
                 ),
                 "source_reliability_score": FeatureValue(
                     name="source_reliability_score",
-                    value=round(vector.get("source_reliability", authority), 4),
+                    value=round(bayes_rel, 4),
                 ),
                 "freshness_score": FeatureValue(
                     name="freshness_score", value=round(freshness, 4)
@@ -171,4 +295,10 @@ class UncertaintyGapCapability(AnalysisCapability):
         return result
 
 
-__all__ = ["SourceConflictCapability", "UncertaintyGapCapability"]
+__all__ = [
+    "BayesianSourceReliabilityTracker",
+    "BetaPrior",
+    "SourceConflictCapability",
+    "UncertaintyGapCapability",
+    "fuse_evidence_probabilities",
+]

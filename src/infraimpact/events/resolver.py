@@ -471,11 +471,153 @@ def _bearing(a: tuple[float, float], b: tuple[float, float]) -> float:
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
+@dataclass
+class ObservationCluster:
+    cluster_id: int
+    observations: list[Observation]
+    centroid: tuple[float, float] | None
+    earliest: Any
+    latest: Any
+
+
+def cluster_unresolved_observations(
+    observations: Sequence[Observation],
+    eps_m: float = 1500.0,
+    time_window_min: float = 120.0,
+    min_samples: int = 1,
+) -> list[ObservationCluster]:
+    """Cluster raw/unresolved observations into candidate spatiotemporal event groups using scikit-learn DBSCAN.
+
+    Uses DBSCAN with the haversine metric on geographic coordinates for spatial proximity,
+    bounded by the time window constraint. Singletons with min_samples=1 form their own clusters;
+    isolated noise points (label -1) are placed in individual clusters.
+    """
+    if not observations:
+        return []
+
+    from collections import defaultdict
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+    from ..domain.geo import centroid_of
+
+    valid_obs: list[tuple[Observation, tuple[float, float], float]] = []
+    no_geom_obs: list[Observation] = []
+
+    for obs in observations:
+        c = centroid_of(obs.geometry) if obs.geometry else None
+        if c:
+            t_sec = obs.event_time.timestamp()
+            valid_obs.append((obs, c, t_sec))
+        else:
+            no_geom_obs.append(obs)
+
+    if not valid_obs:
+        return [
+            ObservationCluster(
+                cluster_id=i,
+                observations=[o],
+                centroid=None,
+                earliest=o.event_time,
+                latest=o.event_time,
+            )
+            for i, o in enumerate(no_geom_obs)
+        ]
+
+    earth_radius_m = 6_371_008.8
+    eps_rad = eps_m / earth_radius_m
+
+    # [lat_rad, lon_rad] for haversine
+    coords_rad = np.radians([[c[1], c[0]] for _, c, _ in valid_obs])
+
+    db = DBSCAN(eps=eps_rad, min_samples=min_samples, metric="haversine")
+    labels = db.fit_predict(coords_rad)
+
+    clusters_map: dict[int, list[tuple[Observation, tuple[float, float], float]]] = defaultdict(list)
+    noise_items: list[tuple[Observation, tuple[float, float], float]] = []
+
+    for label, item in zip(labels, valid_obs, strict=False):
+        if label == -1:
+            noise_items.append(item)
+        else:
+            clusters_map[label].append(item)
+
+    result_clusters: list[ObservationCluster] = []
+    cluster_idx = 0
+
+    for label, items in clusters_map.items():
+        items.sort(key=lambda it: it[2])
+        current_sub: list[tuple[Observation, tuple[float, float], float]] = [items[0]]
+
+        for next_item in items[1:]:
+            time_gap_min = (next_item[2] - current_sub[-1][2]) / 60.0
+            if time_gap_min <= time_window_min:
+                current_sub.append(next_item)
+            else:
+                avg_lon = sum(it[1][0] for it in current_sub) / len(current_sub)
+                avg_lat = sum(it[1][1] for it in current_sub) / len(current_sub)
+                sub_obs = [it[0] for it in current_sub]
+                result_clusters.append(
+                    ObservationCluster(
+                        cluster_id=cluster_idx,
+                        observations=sub_obs,
+                        centroid=(round(avg_lon, 6), round(avg_lat, 6)),
+                        earliest=min(o.event_time for o in sub_obs),
+                        latest=max(o.event_time for o in sub_obs),
+                    )
+                )
+                cluster_idx += 1
+                current_sub = [next_item]
+
+        if current_sub:
+            avg_lon = sum(it[1][0] for it in current_sub) / len(current_sub)
+            avg_lat = sum(it[1][1] for it in current_sub) / len(current_sub)
+            sub_obs = [it[0] for it in current_sub]
+            result_clusters.append(
+                ObservationCluster(
+                    cluster_id=cluster_idx,
+                    observations=sub_obs,
+                    centroid=(round(avg_lon, 6), round(avg_lat, 6)),
+                    earliest=min(o.event_time for o in sub_obs),
+                    latest=max(o.event_time for o in sub_obs),
+                )
+            )
+            cluster_idx += 1
+
+    for item in noise_items:
+        o, c, _ = item
+        result_clusters.append(
+            ObservationCluster(
+                cluster_id=cluster_idx,
+                observations=[o],
+                centroid=c,
+                earliest=o.event_time,
+                latest=o.event_time,
+            )
+        )
+        cluster_idx += 1
+
+    for o in no_geom_obs:
+        result_clusters.append(
+            ObservationCluster(
+                cluster_id=cluster_idx,
+                observations=[o],
+                centroid=None,
+                earliest=o.event_time,
+                latest=o.event_time,
+            )
+        )
+        cluster_idx += 1
+
+    return result_clusters
+
+
 __all__ = [
     "EVENT_BEARING_TYPES",
     "Candidate",
     "EventResolver",
+    "ObservationCluster",
     "Resolution",
+    "cluster_unresolved_observations",
     "new_id",
     "utcnow",
     "InfrastructureDomain",
