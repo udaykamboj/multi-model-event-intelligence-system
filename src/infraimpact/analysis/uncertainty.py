@@ -62,6 +62,22 @@ class SourceConflictCapability(AnalysisCapability):
                 "information_confidence": FeatureValue(
                     name="information_confidence", value=round(confidence, 4)
                 ),
+                "source_authority_score": FeatureValue(
+                    name="source_authority_score", value=round(authority, 4)
+                ),
+                "source_reliability_score": FeatureValue(
+                    name="source_reliability_score",
+                    value=round(vector.get("source_reliability", authority), 4),
+                ),
+                "freshness_score": FeatureValue(
+                    name="freshness_score", value=round(freshness, 4)
+                ),
+                "source_corroboration_score": FeatureValue(
+                    name="source_corroboration_score", value=round(independence, 4)
+                ),
+                "source_disagreement_score": FeatureValue(
+                    name="source_disagreement_score", value=round(penalty, 4)
+                ),
                 "sources_offline": FeatureValue(
                     name="sources_offline", value=float(len(offline))
                 ),

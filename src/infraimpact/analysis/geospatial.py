@@ -72,6 +72,19 @@ class RoadOverlapCapability(AnalysisCapability):
             )
 
         nearest = min((distance_m(n.geometry, geometry) for n in nearby), default=None)
+        blocked_nodes = {n.node_id for n in intersecting}
+        blocked_edges = [
+            e.edge_id for e in self.graph.edges.values()
+            if e.source_node_id in blocked_nodes or e.target_node_id in blocked_nodes
+        ]
+        connectivity = self.graph.connectivity_ratio(blocked_nodes)
+        # Nodes still mutually reachable = largest connected component.
+        reachable_count = int(round(connectivity * len(self.graph.nodes)))
+
+        # Deterministic detour for the severed corridor. Endpoints are derived
+        # from the blocked infrastructure itself, never hardcoded.
+        detour_info = self.graph.corridor_detour(blocked_nodes)
+
         result.features.update(
             {
                 "road_overlap_count": FeatureValue(
@@ -88,11 +101,57 @@ class RoadOverlapCapability(AnalysisCapability):
                     value=round(nearest, 1) if nearest is not None else None,
                     unit="metres",
                 ),
+                "network_connectivity_ratio": FeatureValue(
+                    name="network_connectivity_ratio",
+                    value=connectivity,
+                    unit="ratio",
+                ),
+                "reachable_infrastructure_count": FeatureValue(
+                    name="reachable_infrastructure_count",
+                    value=float(reachable_count),
+                ),
+                "blocked_edges": FeatureValue(
+                    name="blocked_edges",
+                    value=blocked_edges,
+                ),
+                "alternate_routes_available": FeatureValue(
+                    name="alternate_routes_available",
+                    value=float(1 if detour_info["alternate_available"] else 0),
+                ),
+                "primary_route_distance_m": FeatureValue(
+                    name="primary_route_distance_m",
+                    value=float(detour_info["nominal_distance_m"]),
+                    unit="metres",
+                ),
+                "detour_distance_m": FeatureValue(
+                    name="detour_distance_m",
+                    value=float(detour_info["detour_distance_m"]),
+                    unit="metres",
+                ),
+                "detour_percentage": FeatureValue(
+                    name="detour_percentage",
+                    value=float(detour_info["detour_percentage"]),
+                    unit="percent",
+                ),
+                "additional_travel_time_s": FeatureValue(
+                    name="additional_travel_time_s",
+                    value=float(detour_info["additional_travel_time_s"]),
+                    unit="seconds",
+                ),
+                "alternate_route_path": FeatureValue(
+                    name="alternate_route_path",
+                    value=detour_info["detour_path"],
+                ),
             }
         )
         if arterial_hit:
             result.notes.append(
                 f"{len(arterial_hit)} arterial road(s) intersect the observed footprint"
+            )
+        if detour_info["alternate_available"] and detour_info["detour_distance_m"] > 0:
+            result.notes.append(
+                f"detour available: +{detour_info['detour_distance_m']}m (+{detour_info['detour_percentage']}%), "
+                f"+{detour_info['additional_travel_time_s']}s"
             )
         return result
 

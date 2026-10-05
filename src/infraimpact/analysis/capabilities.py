@@ -191,6 +191,7 @@ def build_default_registry(graph: InfrastructureGraph | None = None) -> Capabili
         TrafficAnomalyCapability,
     )
     from .similarity import HistoricalSimilarityCapability
+    from .statistics import StatisticalChangeCapability
     from .transit import TransitDisruptionCapability
     from .uncertainty import SourceConflictCapability
 
@@ -199,6 +200,7 @@ def build_default_registry(graph: InfrastructureGraph | None = None) -> Capabili
         EventClassificationCapability(),
         HistoricalSimilarityCapability(),
         SourceConflictCapability(),
+        StatisticalChangeCapability(),
         RoadOverlapCapability(graph),
         TransitOverlapCapability(graph),
         TransitDisruptionCapability(graph),

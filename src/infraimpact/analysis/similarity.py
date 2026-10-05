@@ -283,18 +283,114 @@ class HistoricalSimilarityCapability(AnalysisCapability):
             return result
 
         best = analogues[0]
-        result.features["historical_similarity_score"] = FeatureValue(
-            name="historical_similarity_score",
-            value=best.similarity_score,
-            confidence=0.90,
+        mean_dur = round(sum(a.duration_hours for a in analogues) / len(analogues), 2)
+        mean_roads = round(sum(a.roads_affected for a in analogues) / len(analogues), 1)
+        mean_transit = round(sum(a.transit_routes_affected for a in analogues) / len(analogues), 1)
+
+        outcome_freqs = {
+            "corridor_closure": 1.0,
+            "transit_reroute": round(sum(1 for a in analogues if a.transit_routes_affected > 0) / len(analogues), 2),
+            "highway_ramp_closure": round(
+                sum(1 for a in analogues if any("i-5" in c.lower() or "ramp" in c.lower() for c in a.subsequent_consequences))
+                / len(analogues),
+                2,
+            ),
+            "arterial_spillover": round(sum(1 for a in analogues if a.roads_affected >= 2) / len(analogues), 2),
+        }
+
+        baseline_conds = {
+            "average_crowd": int(sum(a.crowd_estimate for a in analogues) / len(analogues)),
+            "typical_duration_hours": mean_dur,
+            "typical_roads_affected": mean_roads,
+        }
+
+        dur_dev = round(target_features["duration_hours"] - mean_dur, 2)
+        crowd_dev = round(float(target_features["crowd_estimate"] or 0.0) - baseline_conds["average_crowd"], 1)
+
+        consequences = {
+            "primary": list(best.subsequent_consequences),
+            "secondary": list(analogues[1].subsequent_consequences) if len(analogues) > 1 else [],
+        }
+
+        analogues_list = [a.as_dict() for a in analogues]
+
+        result.features.update(
+            {
+                "historical_similarity_score": FeatureValue(
+                    name="historical_similarity_score",
+                    value=best.similarity_score,
+                    confidence=0.90,
+                ),
+                "historical_analogues_count": FeatureValue(
+                    name="historical_analogues_count",
+                    value=float(len(analogues)),
+                ),
+                "historical_top_analogue_id": FeatureValue(
+                    name="historical_top_analogue_id",
+                    value=best.event_id,
+                ),
+                "historical_top_analogue_headline": FeatureValue(
+                    name="historical_top_analogue_headline",
+                    value=best.headline,
+                ),
+                "historical_mean_duration_hours": FeatureValue(
+                    name="historical_mean_duration_hours",
+                    value=mean_dur,
+                    unit="hours",
+                ),
+                "historical_mean_roads_affected": FeatureValue(
+                    name="historical_mean_roads_affected",
+                    value=mean_roads,
+                ),
+                "historical_mean_transit_routes_affected": FeatureValue(
+                    name="historical_mean_transit_routes_affected",
+                    value=mean_transit,
+                ),
+                "historical_consequences": FeatureValue(
+                    name="historical_consequences",
+                    value=consequences,
+                ),
+                "historical_progression": FeatureValue(
+                    name="historical_progression",
+                    value=" -> ".join(best.observed_trajectory),
+                ),
+                "historical_outcome_frequencies": FeatureValue(
+                    name="historical_outcome_frequencies",
+                    value=outcome_freqs,
+                ),
+                "historical_baseline_conditions": FeatureValue(
+                    name="historical_baseline_conditions",
+                    value=baseline_conds,
+                ),
+                "historical_deviations": FeatureValue(
+                    name="historical_deviations",
+                    value={"duration_deviation_hours": dur_dev, "crowd_deviation": crowd_dev},
+                ),
+                "historical_analogues": FeatureValue(
+                    name="historical_analogues",
+                    value=analogues_list,
+                ),
+            }
         )
-        result.features["historical_analogues_count"] = FeatureValue(
-            name="historical_analogues_count",
-            value=float(len(analogues)),
-        )
-        result.features["historical_top_analogue_id"] = FeatureValue(
-            name="historical_top_analogue_id",
-            value=best.event_id,
+
+        from ..domain.ids import utcnow
+        from ..domain.schemas import ModelOutput
+
+        result.model_outputs.append(
+            ModelOutput(
+                model_id="historical-analogue-retrieval",
+                model_version=self.model_version,
+                prediction_time=utcnow(),
+                input_state_version=ctx.state.state_version,
+                output={
+                    "top_analogue_id": best.event_id,
+                    "similarity_score": best.similarity_score,
+                    "expected_duration_hours": mean_dur,
+                    "outcome_frequencies": outcome_freqs,
+                    "consequences": best.subsequent_consequences,
+                },
+                probability=best.similarity_score,
+            )
         )
 
         result.notes.append(

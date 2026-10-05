@@ -225,8 +225,27 @@ class TestAnalysisMetricsDimensions:
             "event_class_confidence": FeatureValue(name="event_class_confidence", value=0.91),
             "crowd_estimate": FeatureValue(name="crowd_estimate", value=750.0),
             "historical_similarity_score": FeatureValue(name="historical_similarity_score", value=0.84),
+            "historical_consequences": FeatureValue(name="historical_consequences", value=["transit_reroute", "corridor_delay"]),
+            "historical_outcome_frequencies": FeatureValue(name="historical_outcome_frequencies", value={"transit_reroute": 0.85, "corridor_delay": 0.70}),
+            "historical_baseline_conditions": FeatureValue(name="historical_baseline_conditions", value={"typical_volume_vph": 1200.0, "typical_speed_mph": 28.0}),
+            "historical_deviations": FeatureValue(name="historical_deviations", value={"delay_increase_pct": 45.0, "speed_drop_pct": 35.0}),
+            "historical_analogues": FeatureValue(name="historical_analogues", value=[{"event_id": "hist_01", "similarity": 0.84}]),
             "propagation_reach": FeatureValue(name="propagation_reach", value=3.0),
             "route_redundancy": FeatureValue(name="route_redundancy", value=2.0),
+            "traffic_current_speed_mph": FeatureValue(name="traffic_current_speed_mph", value=12.5),
+            "traffic_expected_baseline_speed_mph": FeatureValue(name="traffic_expected_baseline_speed_mph", value=28.0),
+            "traffic_speed_anomaly_ratio": FeatureValue(name="traffic_speed_anomaly_ratio", value=0.45),
+            "traffic_delay_seconds": FeatureValue(name="traffic_delay_seconds", value=420.0),
+            "traffic_delay_percentage": FeatureValue(name="traffic_delay_percentage", value=122.0),
+            "traffic_congestion_level": FeatureValue(name="traffic_congestion_level", value="SEVERE"),
+            "traffic_affected_road_segments": FeatureValue(name="traffic_affected_road_segments", value=["road:4th-ave"]),
+            "network_connectivity_ratio": FeatureValue(name="network_connectivity_ratio", value=0.8),
+            "reachable_infrastructure_count": FeatureValue(name="reachable_infrastructure_count", value=4),
+            "blocked_edges": FeatureValue(name="blocked_edges", value=["road:4th-ave"]),
+            "alternate_routes_available": FeatureValue(name="alternate_routes_available", value=True),
+            "detour_distance_m": FeatureValue(name="detour_distance_m", value=350.0),
+            "detour_percentage": FeatureValue(name="detour_percentage", value=18.5),
+            "transit_alternate_recommendations": FeatureValue(name="transit_alternate_recommendations", value=["Link Light Rail 1 Line", "Route 40"]),
         }
 
         registry = build_default_model_registry()
@@ -497,3 +516,165 @@ class TestMetricsApiEndpoints:
         assert deep["metrics"] is not None
         assert "capabilities_invoked" in deep
         assert "hypotheses" in deep
+        assert "provenance" in deep["metrics"]
+        assert "supporting_sources" in deep["metrics"]["provenance"]
+
+
+class TestMultiSystemIntelligenceRoles:
+    """Verifies that each intelligence system performs its designated role per Design Platform MD."""
+
+    def test_graph_geospatial_deterministic_computation(self):
+        """Graph / Geo must compute actual shortest path detours and connectivity ratios."""
+        from infraimpact.graph.model import build_puget_sound_graph
+
+        graph = build_puget_sound_graph()
+        # Normal path from Seneca to Pine via 4th Ave
+        path, cost = graph.shortest_path("int:seneca-4th", "int:4th-pine", blocked_node_ids=None)
+        assert path is not None
+        assert "road:4th-ave" in path
+
+        # Detour path when 4th Ave is blocked by an event (routes via 3rd Ave and Pine St)
+        detour_path, detour_cost = graph.shortest_path(
+            "int:seneca-4th", "int:4th-pine", blocked_node_ids={"road:4th-ave"}
+        )
+        assert detour_path is not None
+        assert "road:4th-ave" not in detour_path
+        # Detour cost should be greater than or equal to nominal path cost
+        assert detour_cost >= cost
+        assert "road:3rd-ave" in detour_path
+
+        # Detour computation wrapper
+        detour_info = graph.compute_detour(
+            "int:seneca-4th", "int:4th-pine", blocked_node_ids={"road:4th-ave"}
+        )
+        assert detour_info["alternate_available"] is True
+        assert detour_info["detour_distance_m"] >= 0.0
+        assert detour_info["nominal_distance_m"] > 0.0
+
+        # Connectivity ratio calculation
+        conn = graph.connectivity_ratio({"road:4th-ave"})
+        assert 0.0 < conn < 1.0
+
+    def test_traffic_analysis_capability_computes_features(self):
+        """Traffic analysis must compute speed, delay, congestion from data, not heuristics."""
+        from infraimpact.analysis.capabilities import CapabilityContext
+        from infraimpact.analysis.prediction import TrafficAnomalyCapability
+
+        cap = TrafficAnomalyCapability()
+        state = _make_sample_state()
+        obs = [
+            _make_observation("obs_t1", ObservationType.TRAFFIC_FLOW),
+            _make_observation("obs_t2", ObservationType.ROAD_CLOSURE),
+        ]
+        # Attach speed ratio to observation
+        obs[0].structured_payload["speed_ratio"] = 0.30
+
+        ctx = CapabilityContext(
+            region_id="puget-sound",
+            state=state,
+            observations=obs,
+            claims=[],
+        )
+        res = cap.run(ctx)
+        assert "traffic_current_speed_mph" in res.features
+        assert "traffic_expected_baseline_speed_mph" in res.features
+        assert "traffic_delay_seconds" in res.features
+        assert "traffic_congestion_level" in res.features
+        # Speed ratio 0.30 should classify as GRIDLOCK
+        assert res.features["traffic_congestion_level"].value == "GRIDLOCK"
+        assert res.features["traffic_delay_seconds"].value > 0.0
+
+    def test_transit_disruption_capability_computes_features(self):
+        """Transit capability must compute routes, delays, alerts, and alternate corridors."""
+        from infraimpact.analysis.capabilities import CapabilityContext
+        from infraimpact.analysis.transit import TransitDisruptionCapability
+
+        cap = TransitDisruptionCapability()
+        state = _make_sample_state()
+        obs = [
+            _make_observation("obs_tr1", ObservationType.TRANSIT_SERVICE_ALERT, headline="Route 7 reroute downtown"),
+            _make_observation("obs_tr2", ObservationType.VEHICLE_POSITION),
+        ]
+        ctx = CapabilityContext(
+            region_id="puget-sound",
+            state=state,
+            observations=obs,
+            claims=[],
+        )
+        res = cap.run(ctx)
+        assert "transit_vehicle_locations_count" in res.features
+        assert "transit_service_alerts" in res.features
+        assert "transit_mean_delay_seconds" in res.features
+        assert "transit_alternate_recommendations" in res.features
+        assert len(res.features["transit_service_alerts"].value) == 1
+
+    def test_historical_similarity_computes_consequences_and_frequencies(self):
+        """Historical retrieval must output structured consequences and outcome frequencies."""
+        from infraimpact.analysis.capabilities import CapabilityContext
+        from infraimpact.analysis.similarity import HistoricalSimilarityCapability
+
+        cap = HistoricalSimilarityCapability()
+        state = _make_sample_state()
+        ctx = CapabilityContext(
+            region_id="puget-sound",
+            state=state,
+            observations=[_make_observation("obs_h1", ObservationType.ROAD_CLOSURE)],
+            claims=[],
+        )
+        res = cap.run(ctx)
+        assert "historical_similarity_score" in res.features
+        assert "historical_consequences" in res.features
+        assert "historical_outcome_frequencies" in res.features
+        assert "historical_mean_duration_hours" in res.features
+        freqs = res.features["historical_outcome_frequencies"].value
+        assert "transit_reroute" in freqs
+        assert "highway_ramp_closure" in freqs
+
+    def test_provenance_answers_traceability_questions(self):
+        """Provenance must answer all 10 traceability questions required by Design Platform MD."""
+        state = _make_sample_state()
+        obs = [_make_observation("obs_p1", ObservationType.ROAD_CLOSURE)]
+        claims = [Claim(
+            claim_id="clm_p1",
+            observation_id="obs_p1",
+            predicate="road_status",
+            value="closed",
+            source_id="synthetic.puget_sound",
+            truth_status=TruthStatus.CONFIRMED,
+        )]
+        delta = StateDeltaEngine().compare(None, state)
+        metrics = derive_analysis_metrics(
+            state=state,
+            previous_state=None,
+            observations=obs,
+            claims=claims,
+            impacts=list(state.affected_infrastructure),
+            forecasts=[],
+            delta_report=delta,
+            features={"traffic_current_speed_mph": FeatureValue(name="traffic_current_speed_mph", value=15.0)},
+            model_outputs=[],
+            notes=["[traffic_anomaly] Anomaly detected", "llm: advised capability prioritization"],
+            analysis_run_id="run_prov_test",
+            jev_decisions={"primary_impact_domain": {"decision": "road"}},
+        )
+
+        prov = metrics.provenance
+        # 1. Why does the system believe this?
+        assert len(prov.supporting_sources) >= 1
+        # 2. What changed?
+        assert metrics.state_delta.is_material is True
+        # 3. Which sources supported it?
+        assert "synthetic.puget_sound" in prov.supporting_sources
+        # 4. Which capabilities produced this?
+        assert "traffic_anomaly" in prov.capabilities_used
+        # 5. Did the LLM contribute?
+        assert any("llm" in c.lower() for c in prov.llm_contributions)
+        # 6. Did Jev make a decision?
+        assert "primary_impact_domain" in prov.jev_decisions_summary
+        # 7. What deterministic/geospatial calculations were performed?
+        assert len(prov.deterministic_calculations) >= 3
+        # 8. How confident is the result?
+        assert metrics.confidence.composite_confidence > 0.0
+        # 9. How did this affect the user?
+        assert "affected" in prov.user_impact_summary
+

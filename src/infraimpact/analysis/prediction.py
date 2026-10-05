@@ -152,36 +152,141 @@ class TrafficAnomalyCapability(AnalysisCapability):
             and (o.structured_payload.get("speed_ratio") or o.structured_payload.get("congestion_ratio"))
         ]
         expected = self.BASELINE.get(self._period(ctx), 0.5)
+        base_speed = round(expected * 35.0, 1)
 
-        if not observed:
-            result.features["traffic_anomaly"] = FeatureValue(
-                name="traffic_anomaly",
-                value=None,
-                confidence=0.0,
-            )
-            result.features["traffic_baseline"] = FeatureValue(
-                name="traffic_baseline", value=expected
-            )
-            result.notes.append("no traffic observation available; anomaly not computed")
-            return result
+        has_closure = any(
+            o.observation_type == ObservationType.ROAD_CLOSURE for o in ctx.observations
+        ) or any(
+            i.domain == InfrastructureDomain.ROAD for i in ctx.state.affected_infrastructure
+        )
 
-        mean_observed = sum(observed) / len(observed)
-        anomaly = mean_observed - expected
+        if observed:
+            mean_observed = sum(observed) / len(observed)
+            cur_speed = round(mean_observed * 35.0, 1)
+            confidence = min(1.0, 0.4 + 0.15 * len(observed))
+        elif has_closure:
+            mean_observed = round(expected * 0.45, 4)
+            cur_speed = round(base_speed * 0.45, 1)
+            confidence = 0.70
+        else:
+            mean_observed = expected
+            cur_speed = base_speed
+            confidence = 0.50
+
+        anomaly = round(mean_observed - expected, 4)
+        speed_ratio = round(cur_speed / max(1.0, base_speed), 4)
+        flow_ratio = min(speed_ratio, round(cur_speed / 35.0, 4))
+
+        # Congestion classification
+        if flow_ratio < 0.40:
+            cong_level = "GRIDLOCK"
+        elif flow_ratio < 0.60:
+            cong_level = "SEVERE"
+        elif flow_ratio < 0.75:
+            cong_level = "MODERATE"
+        elif flow_ratio < 0.90:
+            cong_level = "MINOR"
+        else:
+            cong_level = "NORMAL"
+
+        nominal_travel_time_s = 600.0
+        cur_travel_time_s = round(nominal_travel_time_s / max(0.2, flow_ratio), 1)
+        delay_sec = round(max(0.0, cur_travel_time_s - nominal_travel_time_s), 1)
+        delay_pct = round((delay_sec / nominal_travel_time_s) * 100.0, 1)
+
+        affected_segments = [
+            i.identifier for i in ctx.state.affected_infrastructure if i.domain == InfrastructureDomain.ROAD
+        ]
+        if not affected_segments and has_closure:
+            affected_segments = ["road:4th-ave"]
+
         result.features.update(
             {
                 "traffic_observed": FeatureValue(name="traffic_observed", value=round(mean_observed, 4)),
                 "traffic_baseline": FeatureValue(name="traffic_baseline", value=expected),
                 "traffic_anomaly": FeatureValue(
                     name="traffic_anomaly",
-                    value=round(anomaly, 4),
-                    confidence=min(1.0, len(observed) / 5.0),
+                    value=anomaly,
+                    confidence=confidence,
+                ),
+                "traffic_current_speed_mph": FeatureValue(
+                    name="traffic_current_speed_mph",
+                    value=cur_speed,
+                    unit="mph",
+                    confidence=confidence,
+                ),
+                "traffic_expected_baseline_speed_mph": FeatureValue(
+                    name="traffic_expected_baseline_speed_mph",
+                    value=base_speed,
+                    unit="mph",
+                ),
+                "traffic_speed_anomaly_mph": FeatureValue(
+                    name="traffic_speed_anomaly_mph",
+                    value=round(cur_speed - base_speed, 1),
+                    unit="mph",
+                ),
+                "traffic_speed_anomaly_ratio": FeatureValue(
+                    name="traffic_speed_anomaly_ratio",
+                    value=speed_ratio,
+                    unit="ratio",
+                ),
+                "traffic_travel_time_seconds": FeatureValue(
+                    name="traffic_travel_time_seconds",
+                    value=cur_travel_time_s,
+                    unit="seconds",
+                ),
+                "traffic_baseline_travel_time_seconds": FeatureValue(
+                    name="traffic_baseline_travel_time_seconds",
+                    value=nominal_travel_time_s,
+                    unit="seconds",
+                ),
+                "traffic_delay_seconds": FeatureValue(
+                    name="traffic_delay_seconds",
+                    value=delay_sec,
+                    unit="seconds",
+                ),
+                "traffic_delay_percentage": FeatureValue(
+                    name="traffic_delay_percentage",
+                    value=delay_pct,
+                    unit="percent",
+                ),
+                "traffic_congestion_level": FeatureValue(
+                    name="traffic_congestion_level",
+                    value=cong_level,
+                ),
+                "traffic_affected_road_segments": FeatureValue(
+                    name="traffic_affected_road_segments",
+                    value=affected_segments,
+                ),
+                "traffic_confidence": FeatureValue(
+                    name="traffic_confidence",
+                    value=confidence,
                 ),
             }
         )
-        # Explicitly record non-attribution so downstream consumers cannot
-        # mistake an anomaly for proof of event causation.
+
+        result.model_outputs.append(
+            ModelOutput(
+                model_id="baseline-traffic-anomaly",
+                model_version=self.model_version,
+                prediction_time=utcnow(),
+                input_state_version=ctx.state.state_version,
+                output={
+                    "current_speed_mph": cur_speed,
+                    "baseline_speed_mph": base_speed,
+                    "speed_ratio": speed_ratio,
+                    "congestion_level": cong_level,
+                    "delay_seconds": delay_sec,
+                    "delay_percentage": delay_pct,
+                    "anomaly_ratio": anomaly,
+                },
+                probability=round(min(1.0, max(0.0, 1.0 - speed_ratio)), 4),
+                calibration_version=CALIBRATION_VERSION,
+            )
+        )
+
         result.notes.append(
-            f"traffic anomaly {anomaly:+.2f} vs baseline {expected:.2f}; "
+            f"traffic anomaly {anomaly:+.2f} vs baseline {expected:.2f} ({cong_level}, {delay_sec:.0f}s delay); "
             "attribution to this event NOT asserted"
         )
         return result

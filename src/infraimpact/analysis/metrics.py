@@ -54,6 +54,19 @@ from ..domain.schemas import (
 from ..graph.model import InfrastructureGraph
 
 
+#: Which engine performed each deterministic calculation. Provenance lists only
+#: those whose capability actually ran in this analysis.
+_DETERMINISTIC_BY_CAPABILITY = {
+    "road_network_exposure": "shapely/GEOS spatial overlap + networkx shortest-path detour and connected-component connectivity",
+    "transit_disruption": "shapely/GEOS transit route and stop overlap",
+    "critical_facility_exposure": "shapely/GEOS critical-facility proximity",
+    "infrastructure_propagation": "weighted BFS dependency propagation over the infrastructure graph",
+    "statistical_change_analysis": "ruptures PELT change-point detection and numpy trend fit",
+    "traffic_anomaly": "baseline-relative speed/delay arithmetic",
+    "historical_similarity": "feature + spatial nearest-neighbour retrieval over historical records",
+}
+
+
 # --------------------------------------------------------------------------
 # 1. Situation Analysis
 # --------------------------------------------------------------------------
@@ -315,6 +328,31 @@ class StateDeltaAnalysis(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# 11. Traceability & Provenance (Evidence-Driven Analysis Trace)
+# --------------------------------------------------------------------------
+
+
+class AnalysisProvenance(BaseModel):
+    """Complete traceability answering why the system reached this conclusion (§43, §47)."""
+
+    analysis_run_id: str = ""
+    event_id: str = ""
+    state_version: int = 1
+    previous_state_version: int | None = None
+    observation_ids: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    supporting_sources: list[str] = Field(default_factory=list)
+    disagreeing_sources: list[str] = Field(default_factory=list)
+    capabilities_used: list[str] = Field(default_factory=list)
+    models_contributed: list[str] = Field(default_factory=list)
+    llm_contributions: list[str] = Field(default_factory=list)
+    jev_decisions_summary: dict[str, Any] = Field(default_factory=dict)
+    deterministic_calculations: list[str] = Field(default_factory=list)
+    confidence_summary: str = ""
+    user_impact_summary: str = ""
+
+
+# --------------------------------------------------------------------------
 # Consolidated Event Analysis Metrics
 # --------------------------------------------------------------------------
 
@@ -336,6 +374,7 @@ class EventAnalysisMetrics(BaseModel):
     predictions: PredictionAnalysis = Field(default_factory=PredictionAnalysis)
     confidence: ConfidenceBreakdown = Field(default_factory=ConfidenceBreakdown)
     state_delta: StateDeltaAnalysis = Field(default_factory=StateDeltaAnalysis)
+    provenance: AnalysisProvenance = Field(default_factory=AnalysisProvenance)
 
     def as_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
@@ -361,6 +400,7 @@ def derive_analysis_metrics(
     history: Any | None = None,
     notes: Sequence[str] | None = None,
     analysis_run_id: str | None = None,
+    jev_decisions: dict[str, Any] | None = None,
 ) -> EventAnalysisMetrics:
     """Derive comprehensive structured metrics across all 10 analytical dimensions."""
     now = utcnow()
@@ -567,88 +607,106 @@ def derive_analysis_metrics(
         mean_disruption_probability=mean_prob,
     )
 
-    # 3. Traffic Analysis
-    traffic_obs = features.get("traffic_observed")
-    traffic_base = features.get("traffic_baseline")
-    traffic_anom = features.get("traffic_anomaly")
-    base_speed = float(traffic_base.value) * 35.0 if traffic_base and traffic_base.value is not None else 35.0
-    if traffic_obs and traffic_obs.value is not None:
-        cur_speed = float(traffic_obs.value) * 35.0
-    elif roads or highways:
-        cur_speed = base_speed * 0.55
-    else:
-        cur_speed = base_speed
+    # 3. Traffic Analysis (derived from TrafficAnomalyCapability results)
+    # Values come only from TrafficAnomalyCapability. If it did not run there is
+    # no traffic analysis; nothing is guessed here.
+    traffic_cur_val = features.get("traffic_current_speed_mph")
+    traffic_base_val = features.get("traffic_expected_baseline_speed_mph")
+    cur_speed = float(traffic_cur_val.value) if traffic_cur_val is not None and traffic_cur_val.value is not None else None
+    base_speed = float(traffic_base_val.value) if traffic_base_val is not None and traffic_base_val.value is not None else None
 
-    speed_ratio = round(cur_speed / base_speed, 4) if cur_speed and base_speed else 1.0
+    def _f(name):
+        fv = features.get(name)
+        return fv.value if fv is not None else None
 
-    # Congestion level
-    if speed_ratio < 0.40:
-        cong_level = "GRIDLOCK"
-    elif speed_ratio < 0.60:
-        cong_level = "SEVERE"
-    elif speed_ratio < 0.75:
-        cong_level = "MODERATE"
-    elif speed_ratio < 0.90:
-        cong_level = "MINOR"
-    else:
-        cong_level = "NORMAL"
+    speed_ratio = _f("traffic_speed_anomaly_ratio")
+    delay_sec = _f("traffic_delay_seconds")
+    delay_pct = _f("traffic_delay_percentage")
+    cong_level = str(_f("traffic_congestion_level") or "NOT_ANALYZED")
+    traffic_ran = cur_speed is not None or base_speed is not None or speed_ratio is not None or delay_sec is not None
 
-    delay_sec = round((1.0 / max(0.2, speed_ratio) - 1.0) * 600.0, 1) if speed_ratio else 0.0
-    delay_pct = round((delay_sec / 600.0) * 100.0, 1) if delay_sec else 0.0
+    affected_segments_val = features.get("traffic_affected_road_segments")
+    affected_segments = list(affected_segments_val.value) if affected_segments_val and isinstance(affected_segments_val.value, list) else []
+    traffic_anom_feat = features.get("traffic_anomaly")
+    traffic_conf = float(features.get("traffic_confidence", FeatureValue(name="", value=float(traffic_anom_feat.confidence) if traffic_anom_feat else 0.0)).value or 0.0)
 
     traffic_analysis = TrafficAnalysis(
         current_speed_mph=round(cur_speed, 1) if cur_speed is not None else None,
-        expected_baseline_speed_mph=round(base_speed, 1),
+        expected_baseline_speed_mph=round(base_speed, 1) if base_speed is not None else None,
         speed_anomaly_ratio=speed_ratio,
-        travel_time_seconds=600.0 + delay_sec,
-        expected_baseline_travel_time_seconds=600.0,
+        travel_time_seconds=_f("traffic_travel_time_seconds"),
+        expected_baseline_travel_time_seconds=_f("traffic_baseline_travel_time_seconds"),
         delay_seconds=delay_sec,
         delay_percentage=delay_pct,
         congestion_level=cong_level,
-        congestion_change=float(traffic_anom.value) if traffic_anom and traffic_anom.value is not None else None,
-        affected_road_segments=[r.identifier for r in roads + highways],
+        congestion_change=float(traffic_anom_feat.value) if traffic_anom_feat and traffic_anom_feat.value is not None else None,
+        affected_road_segments=affected_segments,
         affected_intersections=[i.identifier for i in intersections],
-        route_level_impact={
-            "corridors": ["I-5", "SR-99", "4th Ave Corridor"],
-            "max_delay_min": round(delay_sec / 60.0, 1),
-            "flow_reduction_pct": round(max(0.0, 100.0 - (speed_ratio or 1.0) * 100.0), 1),
-        },
-        traffic_anomaly_confidence=float(traffic_anom.confidence) if traffic_anom else 0.0,
+        route_level_impact=(
+            {
+                "corridors": affected_segments,
+                "max_delay_min": round(delay_sec / 60.0, 1),
+                "flow_reduction_pct": round(max(0.0, 100.0 - speed_ratio * 100.0), 1),
+            }
+            if traffic_ran and delay_sec is not None and speed_ratio is not None
+            else {}
+        ),
+        traffic_anomaly_confidence=traffic_conf,
     )
 
-    # 4. Transit Analysis
+    # 4. Transit Analysis (derived from TransitDisruptionCapability results)
     routes_affected = [t.identifier for t in transit_routes]
     stops_affected = [t.identifier for t in transit_stops]
-    transit_canc_p = float(features.get("p_transit_service_cancellation", FeatureValue(name="", value=0.0)).value or 0.0)
     delay_m = float(features.get("transit_expected_delay_min", FeatureValue(name="", value=0.0)).value or 0.0)
+    transit_canc_p = float(features.get("transit_cancellation_probability", features.get("p_transit_service_cancellation", FeatureValue(name="", value=0.0))).value or 0.0)
+
+    mean_delay_s = float(features.get("transit_mean_delay_seconds", FeatureValue(name="", value=round(delay_m * 60.0, 1))).value or 0.0)
+    max_delay_s = float(features.get("transit_max_delay_seconds", FeatureValue(name="", value=round(delay_m * 90.0, 1))).value or 0.0)
+    delay_mag = str(features.get("transit_delay_magnitude", FeatureValue(name="", value="severe" if delay_m > 15.0 else ("moderate" if delay_m > 5.0 else "minor"))).value or "none")
+    canc_count = int(float(features.get("transit_cancellations_count", FeatureValue(name="", value=1.0 if transit_canc_p > 0.4 else 0.0)).value or 0.0))
+    skipped_stops_feat = features.get("transit_skipped_stops")
+    skipped_stops = list(skipped_stops_feat.value) if skipped_stops_feat and isinstance(skipped_stops_feat.value, list) else stops_affected[:3]
+    alerts_feat = features.get("transit_service_alerts")
+    alerts_list = list(alerts_feat.value) if alerts_feat and isinstance(alerts_feat.value, list) else [str(o.headline) for o in observations if o.observation_type == ObservationType.TRANSIT_SERVICE_ALERT]
+    veh_cnt = int(float(features.get("transit_vehicle_locations_count", FeatureValue(name="", value=len([o for o in observations if o.observation_type == ObservationType.VEHICLE_POSITION]))).value or 0.0))
+    alts_feat = features.get("transit_alternate_recommendations")
+    alts_list = list(alts_feat.value) if alts_feat and isinstance(alts_feat.value, list) else []
 
     transit_analysis = TransitAnalysis(
-        vehicle_locations_count=len([o for o in observations if o.observation_type == ObservationType.VEHICLE_POSITION]),
+        vehicle_locations_count=veh_cnt,
         route_status={r: "delayed" if delay_m > 5.0 else "normal" for r in routes_affected},
-        service_alerts=[str(o.headline) for o in observations if o.observation_type == ObservationType.TRANSIT_SERVICE_ALERT],
-        mean_delay_seconds=round(delay_m * 60.0, 1),
-        max_delay_seconds=round(delay_m * 90.0, 1),
-        delay_magnitude="severe" if delay_m > 15.0 else ("moderate" if delay_m > 5.0 else "minor"),
-        cancellations_count=1 if transit_canc_p > 0.4 else 0,
-        skipped_stops=stops_affected[:3],
+        service_alerts=alerts_list,
+        mean_delay_seconds=mean_delay_s,
+        max_delay_seconds=max_delay_s,
+        delay_magnitude=delay_mag,
+        cancellations_count=canc_count,
+        skipped_stops=skipped_stops,
         affected_routes=routes_affected,
         affected_stops=stops_affected,
         expected_disruption_duration_minutes=round(max(20.0, duration_h * 60.0), 1),
         disruption_probability=transit_canc_p,
-        alternate_transit_recommendations=[
-            "Link Light Rail underground tunnel (immune to surface street disruptions)",
-            "3rd Avenue Transit Mall dedicated corridor",
-        ] if routes_affected else [],
+        alternate_transit_recommendations=alts_list,
         change_from_previous_state={
             "new_routes_disrupted": [r for r in routes_affected if previous_state and r not in [x.identifier for x in previous_state.affected_infrastructure]],
             "delay_delta_minutes": round(delay_m - (float(previous_state.derived.get("transit_delay_min", 0.0)) if previous_state else 0.0), 1),
         },
     )
 
-    # 5. Geographic / Network Analysis
-    blocked_edges = [f"edge:{r.identifier}" for r in roads + highways]
-    detour_dist_m = round(radius_m * 1.8, 1)
-    detour_pct = round((detour_dist_m / max(100.0, radius_m * 2.0)) * 100.0, 1)
+    # 5. Geographic / Network Analysis (derived from RoadOverlapCapability & graph engine)
+    # Network numbers come only from the graph capabilities (networkx). Absent
+    # features mean "not computed" (0), never an estimate made here.
+    def _g(name, default=0.0):
+        fv = features.get(name)
+        return fv.value if fv is not None and fv.value is not None else default
+
+    conn_ratio = float(_g("network_connectivity_ratio"))
+    reach_nodes = int(_g("reachable_infrastructure_count"))
+    blocked_edges = list(_g("blocked_edges", []))
+    alt_routes_avail = int(_g("alternate_routes_available"))
+    prim_dist = float(_g("primary_route_distance_m"))
+    detour_dist = float(_g("detour_distance_m"))
+    detour_pct = float(_g("detour_percentage"))
+    add_time_s = float(_g("additional_travel_time_s"))
     reach_hops = int(float(features.get("propagation_reach", FeatureValue(name="", value=1.0)).value or 1.0))
 
     geo_network = GeographicNetworkAnalysis(
@@ -659,15 +717,15 @@ def derive_analysis_metrics(
             "centroid": list(centroid) if centroid else [],
         }],
         infrastructure_within_affected_area_count=total_infra_items,
-        network_connectivity_ratio=round(max(0.1, 1.0 - (len(blocked_edges) * 0.05)), 4),
-        reachable_infrastructure_count=len(graph.nodes) if graph else 25,
+        network_connectivity_ratio=conn_ratio,
+        reachable_infrastructure_count=reach_nodes,
         blocked_edges=blocked_edges,
-        alternate_routes_available=max(1, int(float(features.get("route_redundancy", FeatureValue(name="", value=2.0)).value or 2.0))),
-        primary_route_distance_m=radius_m * 2.0,
+        alternate_routes_available=alt_routes_avail,
+        primary_route_distance_m=prim_dist,
         primary_route_travel_time_s=600.0,
         baseline_route_travel_time_s=600.0,
-        additional_travel_time_s=delay_sec,
-        detour_distance_m=detour_dist_m,
+        additional_travel_time_s=add_time_s,
+        detour_distance_m=detour_dist,
         detour_percentage=detour_pct,
         network_propagation_reach_hops=reach_hops,
         spatial_overlap_results=[{
@@ -708,53 +766,37 @@ def derive_analysis_metrics(
         },
     )
 
-    # 7. Historical Analysis
+    # 7. Historical Analysis (derived from HistoricalSimilarityCapability results)
     analogues_data: list[dict[str, Any]] = []
     hist_analogue = features.get("historical_analogues")
     if hist_analogue and isinstance(hist_analogue.value, list):
         analogues_data = [a if isinstance(a, dict) else a.as_dict() for a in hist_analogue.value]
-    if not analogues_data:
-        analogues_data = [{
-            "event_id": "hist_sea_2020_0530",
-            "headline": "Downtown Seattle Westlake Demonstration and March",
-            "similarity_score": round(situation.historical_similarity_score or 0.82, 4),
-            "roads_affected": 2,
-            "transit_routes": 4,
-            "duration_hours": 4.5,
-        }]
+    def _h(name, default):
+        fv = features.get(name)
+        return fv.value if fv is not None and fv.value is not None else default
+
+    # Everything below is what HistoricalSimilarityCapability produced; with no
+    # analogues the record is empty rather than filled with plausible numbers.
+    hist_sim = float(_h("historical_similarity_score", 0.0))
+    hist_dur = float(_h("historical_mean_duration_hours", 0.0))
+    hist_prog = str(_h("historical_progression", ""))
+    hist_freqs = dict(_h("historical_outcome_frequencies", {}))
+    raw_conseq = _h("historical_consequences", {})
+    hist_conseq = raw_conseq if isinstance(raw_conseq, dict) else {"consequences": list(raw_conseq)}
+    hist_base = dict(_h("historical_baseline_conditions", {}))
+    hist_dev = dict(_h("historical_deviations", {}))
 
     historical = HistoricalAnalysis(
         analogues=analogues_data,
-        similarity_score=analogues_data[0].get("similarity_score", 0.82) if analogues_data else 0.82,
-        comparable_characteristics={
-            "event_type": event_class,
-            "corridor": "Downtown Seattle / 4th Ave",
-            "peak_period": "pm_peak",
-        },
-        historical_infrastructure_consequences={
-            "mean_roads_closed": 2.5,
-            "mean_transit_reroutes": 3.8,
-            "escalation_rate": 0.12,
-        },
-        historical_duration_hours=analogues_data[0].get("duration_hours", 4.0) if analogues_data else 4.0,
-        historical_geographic_progression="Assembly -> Arterial March -> Public Plaza Dispersal",
-        historical_traffic_consequences={
-            "arterial_delay_minutes": 18.0,
-            "spillover_to_parallel_corridors": True,
-        },
-        outcome_frequencies={
-            "orderly_dispersal": 0.82,
-            "extended_closure": 0.14,
-            "property_impact": 0.04,
-        },
-        baseline_conditions={
-            "typical_volume_vph": 1200,
-            "typical_transit_headway_min": 10.0,
-        },
-        deviations_from_baseline={
-            "volume_drop_pct": -45.0,
-            "delay_increase_pct": delay_pct,
-        },
+        similarity_score=hist_sim,
+        comparable_characteristics={"event_type": event_class} if analogues_data else {},
+        historical_infrastructure_consequences=hist_conseq,
+        historical_duration_hours=hist_dur,
+        historical_geographic_progression=hist_prog,
+        historical_traffic_consequences={},
+        outcome_frequencies=hist_freqs,
+        baseline_conditions=hist_base,
+        deviations_from_baseline=hist_dev,
     )
 
     # 8. Prediction Analysis (Models A-G)
@@ -797,18 +839,19 @@ def derive_analysis_metrics(
         models_requiring_training=list(sorted(set(models_needing_training))),
     )
 
-    # 9. Confidence Breakdown
-    auth_score = state.evidence.vector.get("source_authority", 0.85)
-    indep_score = state.evidence.vector.get("independent_corroboration", 0.75)
-    fresh_score = state.evidence.vector.get("freshness", 0.90)
-    disagree_score = round(min(1.0, state.evidence.contradictions * 0.2), 4)
+    # 9. Confidence Breakdown (derived from SourceConflictCapability results)
+    auth_score = float(features.get("source_authority_score", FeatureValue(name="", value=state.evidence.vector.get("source_authority", 0.85))).value or 0.85)
+    rel_score = float(features.get("source_reliability_score", FeatureValue(name="", value=state.evidence.vector.get("source_reliability", 0.90))).value or 0.90)
+    fresh_score = float(features.get("freshness_score", FeatureValue(name="", value=state.evidence.vector.get("freshness", 0.90))).value or 0.90)
+    indep_score = float(features.get("source_corroboration_score", FeatureValue(name="", value=state.evidence.vector.get("independent_corroboration", 0.75))).value or 0.75)
+    disagree_score = float(features.get("source_disagreement_score", FeatureValue(name="", value=round(min(1.0, state.evidence.contradictions * 0.2), 4))).value or 0.0)
     model_conf = round(sum(m.confidence or 0.8 for m in model_records) / max(1, len(model_records)), 4) if model_records else 0.8
     composite = round(0.30 * auth_score + 0.25 * indep_score + 0.15 * fresh_score + 0.20 * model_conf - 0.10 * disagree_score, 4)
     composite = max(0.05, min(1.0, composite))
 
     confidence = ConfidenceBreakdown(
         source_authority_score=auth_score,
-        source_reliability_score=0.92,
+        source_reliability_score=rel_score,
         freshness_score=fresh_score,
         temporal_precision_seconds=60.0,
         spatial_precision_meters=spatial_precision_m,
@@ -852,6 +895,40 @@ def derive_analysis_metrics(
         summary=f"{len(delta_records)} state change(s) detected; material={delta_report.is_material}",
     )
 
+    # 11. Traceability & Provenance (Evidence-Driven Analysis Trace)
+    used_caps: set[str] = set()
+    for note in notes:
+        if note.startswith("[") and "]" in note:
+            cap_tag = note[1:note.index("]")]
+            used_caps.add(cap_tag)
+    for k in ("event_classification", "traffic_anomaly", "transit_disruption", "transit_disruption_forecast", "road_network_exposure", "historical_similarity", "infrastructure_propagation", "source_conflict_analysis", "critical_facility_exposure", "user_route_exposure", "infrastructure_impact", "time_to_impact", "statistical_change_analysis"):
+        if any(f.startswith(k) or f == k for f in features):
+            used_caps.add(k)
+
+    provenance = AnalysisProvenance(
+        analysis_run_id=analysis_run_id or (delta_report.deltas[0].causes[0] if delta_report.deltas and delta_report.deltas[0].causes else f"run_{state.event_id}_v{state.state_version}"),
+        event_id=state.event_id,
+        state_version=state.state_version,
+        previous_state_version=prev_v,
+        observation_ids=[o.observation_id for o in observations],
+        source_ids=list(sorted({o.source_id for o in observations})),
+        supporting_sources=list(sorted({c.source_id for c in claims if c.source_id and c.truth_status in {TruthStatus.CONFIRMED, TruthStatus.REPORTED}} | {o.source_id for o in observations})),
+        disagreeing_sources=list(sorted({c.source_id for c in claims if c.source_id and c.truth_status not in {TruthStatus.CONFIRMED, TruthStatus.REPORTED}})),
+        capabilities_used=list(sorted(used_caps)),
+        models_contributed=list(sorted({m.model_id for m in model_outputs})),
+        llm_contributions=[n for n in notes if "llm" in n.lower() or "narrative" in n.lower() or "hypothesis" in n.lower()],
+        jev_decisions_summary=jev_decisions or {},
+        deterministic_calculations=[
+            "shapely/GEOS geometry footprint and bounding-box derivation",
+            "temporal rate-of-change and duration calculation",
+            "multi-source evidence decomposition and confidence weighting",
+        ] + [
+            label for cap, label in _DETERMINISTIC_BY_CAPABILITY.items() if cap in used_caps
+        ],
+        confidence_summary=f"Composite confidence {composite:.2f} based on {len(observations)} observations from {len(set(o.source_id for o in observations))} sources",
+        user_impact_summary=f"{total_infra_items} infrastructure items affected across {len(domain_counts)} domains with {max_sev} peak severity",
+    )
+
     return EventAnalysisMetrics(
         schema_version="1.0.0",
         event_id=state.event_id,
@@ -867,10 +944,12 @@ def derive_analysis_metrics(
         predictions=predictions,
         confidence=confidence,
         state_delta=delta_analysis,
+        provenance=provenance,
     )
 
 
 __all__ = [
+    "AnalysisProvenance",
     "ConfidenceBreakdown",
     "EventAnalysisMetrics",
     "GeographicNetworkAnalysis",

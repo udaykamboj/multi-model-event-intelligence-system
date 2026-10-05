@@ -59,6 +59,7 @@ SCHEMA_VERSION = "1.0.0"
 #: after the geospatial capability that computes it.
 DEPENDENCY_ORDER = (
     "source_conflict_analysis",    # -> information_confidence
+    "statistical_change_analysis", # -> change points, trends, arrival rate
     "event_classification",        # -> event_class
     "historical_similarity",       # -> historical similarity & analogues
     "road_network_exposure",       # -> arterial_overlap_count, road_overlap_count
@@ -332,6 +333,7 @@ class AnalysisOrchestrator:
             history=history_tracker,
             notes=all_notes,
             analysis_run_id=analysis_run_id,
+            jev_decisions=jev_decisions,
         )
 
         outcome = AnalysisOutcome(

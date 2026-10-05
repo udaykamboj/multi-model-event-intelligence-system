@@ -43,6 +43,7 @@ class InfrastructureGraph:
         self._out: dict[str, list[str]] = defaultdict(list)
         self._in: dict[str, list[str]] = defaultdict(list)
         self._out_edges: dict[str, list[str]] = defaultdict(list)
+        self._in_edges: dict[str, list[str]] = defaultdict(list)
 
     # -- construction ------------------------------------------------------
 
@@ -51,6 +52,7 @@ class InfrastructureGraph:
         self._out.setdefault(node.node_id, [])
         self._in.setdefault(node.node_id, [])
         self._out_edges.setdefault(node.node_id, [])
+        self._in_edges.setdefault(node.node_id, [])
         return node
 
     def add_edge(self, edge: GraphEdge) -> GraphEdge:
@@ -58,6 +60,7 @@ class InfrastructureGraph:
         self._out[edge.source_node_id].append(edge.target_node_id)
         self._out_edges[edge.source_node_id].append(edge.edge_id)
         self._in[edge.target_node_id].append(edge.source_node_id)
+        self._in_edges[edge.target_node_id].append(edge.edge_id)
         return edge
 
     def connect(
@@ -188,6 +191,181 @@ class InfrastructureGraph:
             if node:
                 out.append(node)
         return out
+
+    # -- networkx-backed network analysis ---------------------------------
+    #
+    # Shortest paths and connectivity are delegated to networkx rather than a
+    # hand-written Dijkstra. Roads are traversable both ways, so the routing
+    # view is undirected; edge cost is metres derived from node geometry.
+
+    def _routing_graph(self, blocked: set[str] | None = None):
+        import networkx as nx
+        from ..domain.geo import centroid_of, haversine_m
+
+        g = nx.Graph()
+        for node_id in self.nodes:
+            if blocked and node_id in blocked:
+                continue
+            g.add_node(node_id)
+        for edge in self.edges.values():
+            a, b = edge.source_node_id, edge.target_node_id
+            if a not in g or b not in g:
+                continue
+            ca = centroid_of(self.nodes[a].geometry)
+            cb = centroid_of(self.nodes[b].geometry)
+            length = haversine_m(ca, cb) if ca and cb else edge.weight * 800.0
+            # Keep the shortest parallel edge.
+            if g.has_edge(a, b) and g[a][b]["length_m"] <= length:
+                continue
+            g.add_edge(a, b, length_m=max(length, 1.0), edge_id=edge.edge_id)
+        return g
+
+    def shortest_path(
+        self,
+        start_node_id: str,
+        end_node_id: str,
+        blocked_node_ids: set[str] | None = None,
+        undirected: bool = True,
+    ) -> tuple[list[str], float] | None:
+        """Shortest path (networkx Dijkstra) avoiding blocked nodes.
+
+        Returns ``(node_path, length_m)`` or ``None`` when unreachable.
+        """
+        import networkx as nx
+
+        blocked = set(blocked_node_ids or ())
+        if start_node_id in blocked or end_node_id in blocked:
+            return None
+        if start_node_id not in self.nodes or end_node_id not in self.nodes:
+            return None
+        g = self._routing_graph(blocked)
+        try:
+            length, path = nx.single_source_dijkstra(
+                g, start_node_id, end_node_id, weight="length_m"
+            )
+        except nx.NetworkXNoPath:
+            return None
+        return list(path), round(float(length), 1)
+
+    def compute_detour(
+        self,
+        start_node_id: str,
+        end_node_id: str,
+        blocked_node_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Nominal route versus the best route that avoids ``blocked_node_ids``."""
+        empty = {
+            "alternate_available": False,
+            "nominal_distance_m": 0.0,
+            "detour_distance_m": 0.0,
+            "detour_percentage": 0.0,
+            "additional_travel_time_s": 0.0,
+            "nominal_path": [],
+            "detour_path": [],
+        }
+        nominal = self.shortest_path(start_node_id, end_node_id)
+        if nominal is None:
+            return empty
+        nominal_path, nominal_m = nominal
+        detour = self.shortest_path(start_node_id, end_node_id, blocked_node_ids)
+        result = {**empty, "nominal_distance_m": nominal_m, "nominal_path": nominal_path}
+        if detour is None:
+            return result
+        detour_path, detour_m = detour
+        extra_m = max(0.0, detour_m - nominal_m)
+        result.update(
+            alternate_available=True,
+            detour_distance_m=round(extra_m, 1),
+            detour_percentage=round(100.0 * extra_m / max(nominal_m, 1.0), 1),
+            # 30 mph urban speed: 13.4 m/s. A stated assumption, not a forecast.
+            additional_travel_time_s=round(extra_m / 13.4, 1),
+            detour_path=detour_path,
+        )
+        return result
+
+    def corridor_detour(self, blocked_node_ids: set[str]) -> dict[str, Any]:
+        """Worst-case detour caused by blocking ``blocked_node_ids``.
+
+        No endpoints are assumed. For each blocked node, the unblocked nodes it
+        connects to are the two sides of the severed corridor; the pair farthest
+        apart is routed with and without the blockage and the largest detour
+        wins. Works for any network, not one city.
+        """
+        from itertools import combinations
+
+        from ..domain.geo import centroid_of, haversine_m
+
+        blocked = set(blocked_node_ids)
+        best: dict[str, Any] | None = None
+        for node_id in blocked:
+            if node_id not in self.nodes:
+                continue
+            neighbours = {
+                n for n in (*self._out.get(node_id, ()), *self._in.get(node_id, ()))
+                if n not in blocked and n in self.nodes
+            }
+            pairs = []
+            for a, b in combinations(sorted(neighbours), 2):
+                ca, cb = centroid_of(self.nodes[a].geometry), centroid_of(self.nodes[b].geometry)
+                if ca and cb:
+                    pairs.append((haversine_m(ca, cb), a, b))
+            if not pairs:
+                continue
+            _, a, b = max(pairs)
+            info = self.compute_detour(a, b, blocked)
+            info["endpoints"] = [a, b]
+            info["blocked_node"] = node_id
+            # An unreachable pair (no alternate) is the worst outcome.
+            score = (not info["alternate_available"], info["detour_distance_m"])
+            if best is None or score > best["_score"]:
+                info["_score"] = score
+                best = info
+        if best is None:
+            return {
+                "alternate_available": True, "nominal_distance_m": 0.0,
+                "detour_distance_m": 0.0, "detour_percentage": 0.0,
+                "additional_travel_time_s": 0.0, "nominal_path": [], "detour_path": [],
+                "endpoints": [], "blocked_node": None,
+            }
+        best.pop("_score", None)
+        return best
+
+    def connectivity_ratio(self, blocked_node_ids: set[str] | None = None) -> float:
+        """Share of the unblocked network still in its largest connected component.
+
+        This is real connectivity (networkx connected components), so cutting a
+        bridge that splits the network lowers it, unlike a simple node count.
+        """
+        import networkx as nx
+
+        blocked = set(blocked_node_ids or ())
+        g = self._routing_graph(blocked)
+        total = len(self.nodes)
+        if total == 0 or g.number_of_nodes() == 0:
+            return 0.0
+        largest = max(len(c) for c in nx.connected_components(g))
+        return round(largest / total, 4)
+
+    def reachable_count(
+        self,
+        origin_node_id: str | None = None,
+        blocked_node_ids: set[str] | None = None,
+    ) -> int:
+        """Nodes reachable from ``origin_node_id`` with blocked nodes removed.
+
+        If origin_node_id is None, returns the size of the largest connected component.
+        """
+        import networkx as nx
+
+        blocked = set(blocked_node_ids or ())
+        g = self._routing_graph(blocked)
+        if g.number_of_nodes() == 0:
+            return 0
+        if origin_node_id is None:
+            return max(len(c) for c in nx.connected_components(g))
+        if origin_node_id not in self.nodes or origin_node_id in blocked:
+            return 0
+        return len(nx.node_connected_component(g, origin_node_id))
 
     def stats(self) -> dict[str, Any]:
         by_class: dict[str, int] = defaultdict(int)

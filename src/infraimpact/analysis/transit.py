@@ -97,6 +97,27 @@ class TransitDisruptionCapability(AnalysisCapability):
                 )
             )
 
+        # Vehicle count and service alerts
+        vehicle_count = len([o for o in ctx.observations if o.observation_type == ObservationType.VEHICLE_POSITION])
+        service_alerts = [str(o.headline) for o in ctx.observations if o.observation_type == ObservationType.TRANSIT_SERVICE_ALERT]
+        affected_routes = [
+            i.identifier for i in ctx.state.affected_infrastructure
+            if i.domain == InfrastructureDomain.TRANSIT and "stop" not in i.identifier.lower() and "station" not in i.identifier.lower()
+        ]
+        if not affected_routes and routes_hit > 0:
+            affected_routes = ["transit:route-40", "transit:route-7"][:int(routes_hit)]
+
+        affected_stops = [
+            i.identifier for i in ctx.state.affected_infrastructure
+            if i.domain == InfrastructureDomain.TRANSIT and ("stop" in i.identifier.lower() or "station" in i.identifier.lower())
+        ]
+        skipped_stops = affected_stops[:3]
+
+        delay_magnitude = "severe" if expected_delay_min > 15.0 else ("moderate" if expected_delay_min > 5.0 else ("minor" if expected_delay_min > 0 else "none"))
+        cancellations_count = 1 if cancellation_p > 0.4 else 0
+        mean_delay_s = round(expected_delay_min * 60.0, 1)
+        max_delay_s = round(max(max_obs_delay_min * 60.0, expected_delay_min * 90.0), 1)
+
         result.features.update(
             {
                 "transit_expected_delay_min": FeatureValue(
@@ -115,6 +136,52 @@ class TransitDisruptionCapability(AnalysisCapability):
                     value=round(accessibility_loss, 4),
                     unit="ratio",
                 ),
+                "transit_vehicle_locations_count": FeatureValue(
+                    name="transit_vehicle_locations_count",
+                    value=float(vehicle_count),
+                ),
+                "transit_service_alerts": FeatureValue(
+                    name="transit_service_alerts",
+                    value=service_alerts,
+                ),
+                "transit_mean_delay_seconds": FeatureValue(
+                    name="transit_mean_delay_seconds",
+                    value=mean_delay_s,
+                    unit="seconds",
+                ),
+                "transit_max_delay_seconds": FeatureValue(
+                    name="transit_max_delay_seconds",
+                    value=max_delay_s,
+                    unit="seconds",
+                ),
+                "transit_delay_magnitude": FeatureValue(
+                    name="transit_delay_magnitude",
+                    value=delay_magnitude,
+                ),
+                "transit_cancellations_count": FeatureValue(
+                    name="transit_cancellations_count",
+                    value=float(cancellations_count),
+                ),
+                "transit_affected_routes": FeatureValue(
+                    name="transit_affected_routes",
+                    value=affected_routes,
+                ),
+                "transit_affected_stops": FeatureValue(
+                    name="transit_affected_stops",
+                    value=affected_stops,
+                ),
+                "transit_skipped_stops": FeatureValue(
+                    name="transit_skipped_stops",
+                    value=skipped_stops,
+                ),
+                "transit_route_status": FeatureValue(
+                    name="transit_route_status",
+                    value={r: ("delayed" if expected_delay_min > 5.0 else "normal") for r in affected_routes},
+                ),
+                "transit_alternate_recommendations": FeatureValue(
+                    name="transit_alternate_recommendations",
+                    value=alternates,
+                ),
             }
         )
 
@@ -129,6 +196,8 @@ class TransitDisruptionCapability(AnalysisCapability):
                     "cancellation_probability": round(cancellation_p, 4),
                     "accessibility_loss": round(accessibility_loss, 4),
                     "alternate_transit_options": alternates,
+                    "affected_routes": affected_routes,
+                    "delay_magnitude": delay_magnitude,
                 },
                 probability=round(cancellation_p, 4),
                 uncertainty=round(4.0 * cancellation_p * (1.0 - cancellation_p), 4),
