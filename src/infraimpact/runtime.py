@@ -552,16 +552,6 @@ class Runtime:
         ahead of it, and must be picked up again on the next pass.
         """
         dirty = set(self._dirty)
-        for event_id in self.repo.events.active_events():
-            latest_run = self.repo.runs.latest_for_event(event_id)
-            if latest_run is None:
-                if self.repo.observations.list_for_event(event_id):
-                    dirty.add(event_id)
-                continue
-            if latest_run.new_state_version > _latest_version(
-                self.repo.states.history(event_id)
-            ):
-                dirty.add(event_id)
         return sorted(dirty)
 
     # -- stage 2: resolve, rebuild, analyse -------------------------------

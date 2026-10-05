@@ -113,9 +113,14 @@ def _analysis_view(run: AnalysisRun) -> AnalysisView:
 
 
 def _event_row(repo: Any, event_id: str) -> dict[str, Any]:
-    for row in repo.events.all_events():
-        if row["event_id"] == event_id:
+    if hasattr(repo.events, "get"):
+        row = repo.events.get(event_id)
+        if row is not None:
             return row
+    else:
+        for row in repo.events.all_events():
+            if row["event_id"] == event_id:
+                return row
     raise HTTPException(
         status_code=404,
         detail=f"unknown event '{event_id}'",
@@ -143,7 +148,7 @@ def _populate_summary_details(summary: EventSummary, state: EventState | None, r
         if state.affected_infrastructure:
             updates["location"] = ", ".join(i.name or i.identifier for i in state.affected_infrastructure[:2])
 
-    obs = repo.observations.list_for_event(summary.event_id)
+    obs = repo.observations.list_for_event(summary.event_id, limit=5)
     if obs:
         updates["observation_count"] = len(obs)
         if not updates.get("source_count"):
@@ -227,19 +232,27 @@ async def list_events(
     since: str | None = Query(default=None, description="ISO-8601 updated_at lower bound"),
 ) -> EventListResponse:
     """Newest-first event list with kind and phase filtering."""
-    rows = repo.events.all_events()
-    if status:
-        rows = [r for r in rows if r.get("status") == status]
-    if kind:
-        rows = [r for r in rows if r.get("kind") == kind]
-    if phase:
-        rows = [r for r in rows if r.get("phase") == phase]
+    cutoff = None
+    cutoff_str = None
     if since:
         cutoff = parse_time(since)
         if cutoff is None:
             raise HTTPException(status_code=400, detail=f"could not parse 'since'={since!r}")
-        rows = [r for r in rows if (_maybe_dt(r.get("updated_at")) or cutoff) >= cutoff]
-    rows = rows[:limit]
+        cutoff_str = cutoff.isoformat()
+
+    if hasattr(repo.events, "list_events"):
+        rows = repo.events.list_events(status=status, kind=kind, phase=phase, since=cutoff_str, limit=limit)
+    else:
+        rows = repo.events.all_events()
+        if status:
+            rows = [r for r in rows if r.get("status") == status]
+        if kind:
+            rows = [r for r in rows if r.get("kind") == kind]
+        if phase:
+            rows = [r for r in rows if r.get("phase") == phase]
+        if cutoff:
+            rows = [r for r in rows if (_maybe_dt(r.get("updated_at")) or cutoff) >= cutoff]
+        rows = rows[:limit]
 
     summaries: list[EventSummary] = []
     for row in rows:

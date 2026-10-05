@@ -150,8 +150,8 @@ def create_app(
         try:
             repo = get_repository(request)
             counts["observations"] = repo.observations.count()
-            counts["events"] = len(repo.events.all_events())
-            counts["users"] = len(repo.users.all())
+            counts["events"] = repo.events.count() if hasattr(repo.events, "count") else len(repo.events.all_events())
+            counts["users"] = repo.users.count() if hasattr(repo.users, "count") else len(repo.users.all())
         except Exception as exc:  # noqa: BLE001 - health must not raise
             log.exception("healthz probe failed")
             healthy = False

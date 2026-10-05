@@ -83,31 +83,34 @@ class SituationEngine:
         """Cluster events that share geographic proximity and temporal overlap."""
         clusters: list[list[EventState]] = []
         assigned: set[str] = set()
+        now = datetime.now(UTC)
 
-        for i, ev_a in enumerate(events):
+        sorted_events = sorted(
+            [e for e in events if e.geometry],
+            key=lambda e: e.first_observed or now,
+        )
+
+        for i, ev_a in enumerate(sorted_events):
             if ev_a.event_id in assigned:
                 continue
             geom_a = ev_a.geometry
-            if not geom_a:
-                continue
             cluster = [ev_a]
             assigned.add(ev_a.event_id)
+            t_a = ev_a.first_observed or now
 
-            for j, ev_b in enumerate(events):
-                if ev_b.event_id in assigned or j <= i:
+            for j in range(i + 1, len(sorted_events)):
+                ev_b = sorted_events[j]
+                if ev_b.event_id in assigned:
                     continue
+                t_b = ev_b.first_observed or now
+                if (t_b - t_a).total_seconds() > SITUATION_WINDOW_SECONDS:
+                    break
+
                 geom_b = ev_b.geometry
-                if not geom_b:
-                    continue
-
                 dist = distance_m(geom_a, geom_b)
                 if dist is not None and dist <= SITUATION_RADIUS_M:
-                    # Check temporal compatibility
-                    t_a = ev_a.first_observed or datetime.now(UTC)
-                    t_b = ev_b.first_observed or datetime.now(UTC)
-                    if abs((t_a - t_b).total_seconds()) <= SITUATION_WINDOW_SECONDS:
-                        cluster.append(ev_b)
-                        assigned.add(ev_b.event_id)
+                    cluster.append(ev_b)
+                    assigned.add(ev_b.event_id)
 
             clusters.append(cluster)
         return clusters

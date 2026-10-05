@@ -11,8 +11,10 @@ contract, and the geo column set here is what promotes cleanly to
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -61,6 +63,8 @@ from .repository import (
     UserRepository,
     WorldSnapshotRepository,
 )
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -319,6 +323,7 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS idx_claims_event ON claims(event_id, predicate);
 CREATE INDEX IF NOT EXISTS idx_claims_pred ON claims(predicate, valid_from DESC);
+CREATE INDEX IF NOT EXISTS idx_claims_obs ON claims(observation_id);
 
 CREATE TABLE IF NOT EXISTS analysis_runs (
     analysis_run_id  TEXT PRIMARY KEY,
@@ -552,7 +557,12 @@ class _SqliteRepo:
 
     def _query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self._conn.execute(sql, params))
+            t0 = time.perf_counter()
+            res = list(self._conn.execute(sql, params))
+            dur = time.perf_counter() - t0
+            if dur > 0.2:
+                log.warning("SLOW QUERY (%.3fs): %s | params=%s", dur, sql.strip().replace("\n", " ")[:120], params)
+            return res
 
     def _many(self, sql: str, rows: Iterable[Sequence[Any]]) -> None:
         with self._lock:
@@ -622,11 +632,12 @@ class SqliteObservationRepository(_SqliteRepo, ObservationRepository):
         rows = self._query("SELECT 1 FROM observations WHERE dedupe_key=?", (dedupe_key,))
         return bool(rows)
 
-    def list_for_event(self, event_id: str) -> list[Observation]:
+    def list_for_event(self, event_id: str, limit: int | None = None) -> list[Observation]:
+        lim_clause = f" LIMIT {int(limit)}" if limit is not None else ""
         rows = self._query(
-            """SELECT o.* FROM observations o
+            f"""SELECT o.* FROM observations o
                JOIN event_observations eo ON eo.observation_id = o.observation_id
-               WHERE eo.event_id = ? ORDER BY o.observed_at ASC""",
+               WHERE eo.event_id = ? ORDER BY o.observed_at ASC{lim_clause}""",
             (event_id,),
         )
         return [_row_to_observation(r) for r in rows]
@@ -844,6 +855,49 @@ class SqliteEventRepository(_SqliteRepo, EventRepository):
                FROM events e ORDER BY e.updated_at DESC"""
         )
         return [dict(r) for r in rows]
+
+    def list_events(
+        self,
+        status: str | None = None,
+        kind: str | None = None,
+        phase: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("e.status = ?")
+            params.append(status)
+        if kind:
+            clauses.append("e.kind = ?")
+            params.append(kind)
+        if phase:
+            clauses.append("e.phase = ?")
+            params.append(phase)
+        if since:
+            clauses.append("e.updated_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._query(
+            f"""SELECT e.*, (SELECT COUNT(*) FROM event_observations eo WHERE eo.event_id=e.event_id) AS observation_count
+                FROM events e {where} ORDER BY e.updated_at DESC LIMIT ?""",
+            tuple(params),
+        )
+        return [dict(r) for r in rows]
+
+    def count(self) -> int:
+        rows = self._query("SELECT COUNT(*) AS c FROM events")
+        return int(rows[0]["c"]) if rows else 0
+
+    def get(self, event_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            """SELECT e.*, (SELECT COUNT(*) FROM event_observations eo WHERE eo.event_id=e.event_id) AS observation_count
+               FROM events e WHERE e.event_id = ? LIMIT 1""",
+            (event_id,),
+        )
+        return dict(rows[0]) if rows else None
 
     def status_of(self, event_id: str) -> str | None:
         rows = self._query("SELECT status FROM events WHERE event_id=?", (event_id,))
@@ -1268,14 +1322,13 @@ class SqliteStateRepository(_SqliteRepo, StateRepository):
         """
 
         rows = self._query(
-            """SELECT state FROM (
-                   SELECT state, state_version, reconstructed_at,
-                          ROW_NUMBER() OVER (
-                              PARTITION BY event_id ORDER BY state_version DESC
-                          ) AS rn
+            """SELECT es.state FROM event_states es
+               JOIN (
+                   SELECT event_id, MAX(state_version) AS max_v
                    FROM event_states
-               ) WHERE rn = 1
-               ORDER BY reconstructed_at DESC
+                   GROUP BY event_id
+               ) latest ON es.event_id = latest.event_id AND es.state_version = latest.max_v
+               ORDER BY es.reconstructed_at DESC
                LIMIT ?""",
             (limit,),
         )
@@ -1581,6 +1634,10 @@ class SqliteUserRepository(_SqliteRepo, UserRepository):
 
     def all(self) -> list[UserContext]:
         return [_row_to_user(r) for r in self._query("SELECT * FROM users")]
+
+    def count(self) -> int:
+        rows = self._query("SELECT COUNT(*) AS c FROM users")
+        return int(rows[0]["c"]) if rows else 0
 
     def set_ephemeral_location(
         self, user_id: str, geometry: dict[str, Any] | None, expires_at: datetime | None

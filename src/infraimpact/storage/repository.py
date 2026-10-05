@@ -48,7 +48,7 @@ class ObservationRepository(ABC):
     def has_dedupe_key(self, dedupe_key: str) -> bool: ...
 
     @abstractmethod
-    def list_for_event(self, event_id: str) -> list[Observation]: ...
+    def list_for_event(self, event_id: str, limit: int | None = None) -> list[Observation]: ...
 
     @abstractmethod
     def event_ids_between(self, start: datetime, end: datetime) -> list[str]:
@@ -118,6 +118,12 @@ class EventRepository(ABC):
 
     @abstractmethod
     def all_events(self) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    def count(self) -> int: ...
+
+    @abstractmethod
+    def get(self, event_id: str) -> dict[str, Any] | None: ...
 
     @abstractmethod
     def status_of(self, event_id: str) -> str | None:
@@ -288,6 +294,9 @@ class UserRepository(ABC):
 
     @abstractmethod
     def all(self) -> list[UserContext]: ...
+
+    @abstractmethod
+    def count(self) -> int: ...
 
     @abstractmethod
     def set_ephemeral_location(

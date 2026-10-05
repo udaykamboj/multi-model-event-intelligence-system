@@ -942,7 +942,7 @@ def get_template() -> str:
 
       // Initial boot
       refresh();
-      setInterval(refresh, 3500);
+      setInterval(refresh, 10000);
     </script>
   </body>
 </html>
