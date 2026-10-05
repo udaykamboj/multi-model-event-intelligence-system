@@ -222,3 +222,74 @@ class NotificationReason(StrEnum):
     ESCALATION = "escalation"
     RESOLUTION = "resolution"
     OFFICIAL_GUIDANCE = "official_guidance"
+
+
+# --------------------------------------------------------------------------
+# Stage 1: Event System Architecture Enums
+# --------------------------------------------------------------------------
+
+
+class EventKind(StrEnum):
+    """Stage 1 section 3: Three event kinds."""
+
+    INCIDENT = "incident"      # Discrete occurrence with a start (collision, fire, arrest, earthquake)
+    CONDITION = "condition"    # Interval with start, persistence, end (closure, outage, restriction)
+    SITUATION = "situation"    # Compound parent event containing child incidents/conditions (protest, storm)
+
+
+class EventPhase(StrEnum):
+    """Stage 1 section 3/5: Lifecycle phase of an event."""
+
+    SCHEDULED = "scheduled"    # Future-dated (e.g. 2027 market, planned maintenance)
+    ACTIVE = "active"          # Currently occurring / confirmed persisting
+    ENDED = "ended"            # Condition concluded (with duration)
+    HISTORICAL = "historical"  # Past incident or aged-out report
+
+
+class SignificanceClass(StrEnum):
+    """Stage 1 section 4: Significance gate classification before correlation."""
+
+    EVENT_CANDIDATE = "event_candidate"  # Significant: creates or matches persistent events
+    STATE_ONLY = "state_only"            # Routine state (road clear, normal bridge): updates state store, no event
+    CONTEXT = "context"                  # Schedule/permit/mobility: kept and indexed, scheduled events only
+    NOISE = "noise"                      # Filtered or irrelevant: kept in ledger, never correlated
+
+
+class SituationTrajectory(StrEnum):
+    """Stage 1 section 7: Trajectory of compound situations."""
+
+    BUILDING = "building"
+    STEADY = "steady"
+    ESCALATING = "escalating"
+    DE_ESCALATING = "de_escalating"
+    ENDED = "ended"
+
+
+class MatchDecision(StrEnum):
+    """Stage 1 section 6: Correlation decision."""
+
+    MATCH = "match"          # High score -> merge / attach
+    POSSIBLE = "possible"    # Moderate score -> review queue candidate, not merged
+    NEW = "new"              # Low score -> open new event (if significance gate allows)
+    CONFLICT = "conflict"    # Contradictory claims -> record contradiction
+
+
+class SourceSemantics(StrEnum):
+    """Stage 1 section 2: Source policy feed semantics."""
+
+    EVENT_FEED = "event-feed"        # Emits distinct incident events
+    STATE_FEED = "state-feed"        # Emits current state/conditions (closures, vessels, bridge status)
+    ARTICLE_FEED = "article-feed"    # Unstructured news/blotter reporting
+    SCHEDULE_FEED = "schedule-feed"  # Planned/scheduled permits or calendar entries
+
+
+class SourceHealthStatus(StrEnum):
+    """Stage 1 section 11: Comprehensive source health statuses."""
+
+    HEALTHY = "healthy"
+    HEALTHY_NO_MATCHES = "healthy_no_matches"
+    STALE = "stale"
+    EMPTY_UNEXPECTED = "empty_unexpected"
+    ERROR = "error"
+    NEVER_CONNECTED = "never_connected"
+    DISABLED = "disabled"

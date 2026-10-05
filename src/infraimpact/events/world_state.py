@@ -19,8 +19,11 @@ from typing import Any, Iterable, Sequence
 
 from ..domain.enums import (
     Authority,
+    EventKind,
+    EventPhase,
     InfrastructureDomain,
     ObservationType,
+    SituationTrajectory,
     TruthStatus,
     Urgency,
 )
@@ -29,13 +32,17 @@ from ..domain.ids import utcnow
 from ..domain.schemas import (
     AffectedInfrastructure,
     Claim,
+    Contradiction,
     EventState,
     EvidenceSummary,
     MovementState,
     Observation,
+    TimelineEntry,
 )
+from ..ingestion.policy import SOURCE_FAMILIES, canonicalize_url
 from ..storage.repository import StateRepository
 from .lifecycle import LifecycleEngine
+from .resolver import infer_event_kind, infer_initial_phase
 from .scale import ScaleEstimator
 
 log = logging.getLogger(__name__)
@@ -98,6 +105,14 @@ class WorldStateEngine:
         claims: Sequence[Claim],
         previous: EventState | None = None,
         now=None,
+        kind: EventKind | None = None,
+        phase: EventPhase | None = None,
+        parent_event_id: str | None = None,
+        child_event_ids: Sequence[str] = (),
+        timeline: Sequence[TimelineEntry] = (),
+        contradictions: Sequence[Contradiction] = (),
+        trajectory: SituationTrajectory | None = None,
+        escalation_factors: Sequence[str] = (),
     ) -> EventState:
         """Reconstruct the state for one event.
 
@@ -113,6 +128,23 @@ class WorldStateEngine:
         ordered = sorted(observations, key=lambda o: (o.event_time, o.observation_id))
         first = ordered[0].event_time if ordered else now
         last = ordered[-1].observed_at if ordered else now
+
+        if kind is None:
+            kind = previous.kind if previous else (infer_event_kind(ordered[0]) if ordered else EventKind.INCIDENT)
+        if phase is None:
+            phase = previous.phase if previous else (infer_initial_phase(ordered[0], kind) if ordered else EventPhase.ACTIVE)
+        if parent_event_id is None and previous:
+            parent_event_id = previous.parent_event_id
+        if not child_event_ids and previous:
+            child_event_ids = previous.child_event_ids
+        if not timeline and previous:
+            timeline = previous.timeline
+        if not contradictions and previous:
+            contradictions = previous.contradictions
+        if trajectory is None and previous:
+            trajectory = previous.trajectory
+        if not escalation_factors and previous:
+            escalation_factors = previous.escalation_factors
 
         geometry, geometry_confidence = self._footprint(ordered)
         movement = self._movement(ordered, previous)
@@ -133,6 +165,10 @@ class WorldStateEngine:
         return EventState(
             event_id=event_id,
             state_version=(previous.state_version + 1) if previous else 1,
+            kind=kind,
+            phase=phase,
+            parent_event_id=parent_event_id,
+            child_event_ids=tuple(child_event_ids),
             event_type_distribution=distribution,
             # Lifecycle owns status. It is the same value it publishes to
             # ``event_lifecycle``, which is what stops the status in a state
@@ -148,6 +184,10 @@ class WorldStateEngine:
             evidence=evidence,
             scale=scale,
             lifecycle=lifecycle,
+            trajectory=trajectory,
+            escalation_factors=tuple(escalation_factors),
+            timeline=tuple(timeline),
+            contradictions=tuple(contradictions),
             observation_ids=tuple(o.observation_id for o in ordered),
             claim_ids=tuple(c.claim_id for c in claims),
             derived=derived,
@@ -310,12 +350,50 @@ class WorldStateEngine:
             else None
         )
 
+        # Distinct documents (e.g. canonical URLs, content hashes, or distinct record IDs)
+        doc_keys = set()
+        for o in observations:
+            if o.source_url:
+                doc_keys.add(canonicalize_url(o.source_url))
+            elif o.source_record_id:
+                doc_keys.add(f"{o.source_id}:{o.source_record_id}")
+            else:
+                doc_keys.add(o.provenance.content_hash or o.observation_id)
+        distinct_docs = len(doc_keys)
+
+        # Source families
+        families = Counter(SOURCE_FAMILIES.get(o.source_id, o.source_id) for o in observations)
+        family_count = len(families)
+
+        # Meaningful updates (version > 1)
+        meaningful_updates = len({(o.source_id, o.source_record_id, o.version) for o in observations if o.version > 1})
+
+        # Duplicates (re-crawled/re-polled observations)
+        duplicates = max(0, len(observations) - distinct_docs)
+
+        # Stage 1 section 9: Honest Event-level confidence
+        # Raw observation volume must NEVER enter the formula.
+        top_auth = max(
+            (o.provenance.authority for o in observations),
+            key=lambda a: 1.0 if a is Authority.OFFICIAL else (0.8 if a is Authority.SEMI_OFFICIAL else (0.6 if a is Authority.ESTABLISHED_MEDIA else 0.3)),
+            default=Authority.UNVERIFIED,
+        )
+        base_conf = 0.92 if top_auth is Authority.OFFICIAL else (0.80 if top_auth is Authority.SEMI_OFFICIAL else (0.68 if top_auth is Authority.ESTABLISHED_MEDIA else 0.40))
+        if independent >= 3:
+            base_conf = min(0.98, base_conf + 0.15)
+        elif independent >= 2:
+            base_conf = min(0.95, base_conf + 0.10)
+        if contradictions > 0:
+            base_conf = max(0.20, base_conf - 0.12 * contradictions)
+        event_confidence = round(base_conf, 4)
+
         vector = {
             "source_authority": _authority_score(authorities),
             "independent_corroboration": round(min(1.0, independent / 3.0), 4),
             "corroboration_score": corroboration.corroboration_score,
             "independence_ratio": corroboration.independence_ratio,
             "freshness": _freshness_score(freshness),
+            "event_confidence": event_confidence,
             "spatial_precision": round(
                 sum(o.quality.spatial_precision for o in observations) / len(observations), 4
             )
@@ -337,8 +415,15 @@ class WorldStateEngine:
         return EvidenceSummary(
             source_count=len({o.source_id for o in observations}),
             independent_source_count=independent,
+            source_family_count=family_count,
+            distinct_document_count=distinct_docs,
+            observation_count=len(observations),
+            raw_poll_count=len(observations),
+            duplicate_count=duplicates,
+            meaningful_update_count=meaningful_updates,
             authorities=dict(authorities),
             observation_types=dict(obs_types),
+            source_families=dict(families),
             contradictions=contradictions,
             freshness_seconds=freshness,
             vector=vector,

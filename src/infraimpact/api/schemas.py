@@ -40,17 +40,28 @@ class EventSummary(BaseModel):
     title: str = ""
     location: str = ""
     dominant_type: str = ""
+    kind: str = "incident"
+    phase: str = "active"
+    parent_event_id: str | None = None
+    child_event_ids: list[str] = Field(default_factory=list)
+    timeline_entries: list[dict[str, Any]] = Field(default_factory=list)
+    contradictions: list[dict[str, Any]] = Field(default_factory=list)
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    relations: list[dict[str, Any]] = Field(default_factory=list)
+    trajectory: str | None = None
+    escalation_factors: list[str] = Field(default_factory=list)
     first_observed: datetime | None = None
     updated_at: datetime | None = None
     closed_at: datetime | None = None
     observation_count: int = 0
+    distinct_document_count: int = 1
     source_count: int = 1
+    source_family_count: int = 1
     independent_source_count: int = 1
     confidence: float = 0.5
     geometry: dict[str, Any] | None = None
     state_version: int | None = None
     last_reconstructed_at: datetime | None = None
-
 
 
 class EventListResponse(BaseModel):
@@ -97,6 +108,28 @@ class EventDetail(BaseModel):
     forecast: list[Forecast] = Field(default_factory=list)
     evidence_summary: EvidenceSummary = Field(default_factory=EvidenceSummary)
     last_updated: datetime | None = None
+
+
+class ReviewQueueResponse(BaseModel):
+    schema_version: str = SCHEMA_VERSION
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    contradictions: list[dict[str, Any]] = Field(default_factory=list)
+    total_pending: int = 0
+
+
+class CoverageDomain(BaseModel):
+    domain: str
+    total_sources: int = 0
+    healthy_sources: int = 0
+    producing_data_sources: int = 0
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CoverageResponse(BaseModel):
+    schema_version: str = SCHEMA_VERSION
+    domains: list[CoverageDomain] = Field(default_factory=list)
+    total_sources: int = 0
+    healthy_sources: int = 0
 
 
 

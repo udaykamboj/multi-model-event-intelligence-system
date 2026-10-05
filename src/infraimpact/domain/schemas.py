@@ -26,13 +26,20 @@ from .enums import (
     Authority,
     CapabilityTier,
     EdgeKind,
+    EventKind,
+    EventPhase,
     HealthState,
     InfrastructureDomain,
     InferenceKind,
+    MatchDecision,
     NodeClass,
     NotificationReason,
     ObservationType,
     PresentationType,
+    SignificanceClass,
+    SituationTrajectory,
+    SourceHealthStatus,
+    SourceSemantics,
     SourceType,
     TruthStatus,
     Urgency,
@@ -83,6 +90,37 @@ class ObservationQuality(Frozen):
         )
 
 
+# --------------------------------------------------------------------------
+# Stage 1 Source Policy & Record Tracking
+# --------------------------------------------------------------------------
+
+
+class SourcePolicy(BaseModel):
+    """Stage 1 section 2: Per-source ingestion and polling policy."""
+
+    source_id: str
+    poll_interval_s: float = 60.0
+    semantics: SourceSemantics = SourceSemantics.EVENT_FEED
+    id_field: str = "id"
+    expected_update_rate: float = 1.0
+    disappearance_threshold_polls: int = 3
+    freshness_ttl_s: float = 21600.0  # 6 hours default
+
+
+class SourceRecord(BaseModel):
+    """Stage 1 section 2: Tracking identity and disappearance of source records across polls."""
+
+    source_id: str
+    source_record_id: str
+    fingerprint: str
+    version: int = 1
+    first_seen: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_confirmed: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    missed_polls: int = 0
+    is_active: bool = True
+    ended_at: datetime | None = None
+
+
 class Observation(BaseModel):
     """Universal observation envelope emitted by every source adapter."""
 
@@ -94,13 +132,17 @@ class Observation(BaseModel):
     source_id: str
     source_record_id: str
 
-    # Three mandatory timestamps: feeds arrive late and out of order (section 6).
-    event_time: datetime
-    observed_at: datetime
-    ingested_at: datetime
+    # Four timestamps (Stage 1 section 5): event_time, published_at, observed_at, ingested_at
+    event_time: datetime | None = None
+    event_time_confidence: str = "known"
+    published_at: datetime | None = None
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    ingested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     source_type: SourceType
     observation_type: ObservationType
+    significance_class: SignificanceClass = SignificanceClass.EVENT_CANDIDATE
+    version: int = 1
 
     geometry: Geometry | None = None
     location_precision_m: float | None = None
@@ -125,6 +167,7 @@ class Observation(BaseModel):
         return deterministic_id("dk", explicit) if self.source_record_id else deterministic_id(
             "dk", content_hash(self.structured_payload)
         )
+
 
 
 
@@ -236,16 +279,24 @@ class EvidenceNarrative(BaseModel):
 
 
 class EvidenceSummary(BaseModel):
-    """Section 39/40: corroboration discounts dependent sources.
+    """Section 39/40 & Stage 1 section 9: corroboration and honest counts.
 
-    Measured only. Nothing a model wrote is ever stored here - see
-    :class:`EvidenceNarrative` for why.
+    Measured only. Stored separately per Stage 1:
+    distinct documents, independent sources, source families, observation count,
+    raw polls, duplicates, and meaningful updates.
     """
 
     source_count: int = 0
     independent_source_count: int = 0
+    source_family_count: int = 0
+    distinct_document_count: int = 0
+    observation_count: int = 0
+    raw_poll_count: int = 0
+    duplicate_count: int = 0
+    meaningful_update_count: int = 0
     authorities: dict[str, int] = Field(default_factory=dict)
     observation_types: dict[str, int] = Field(default_factory=dict)
+    source_families: dict[str, int] = Field(default_factory=dict)
     contradictions: int = 0
     freshness_seconds: float | None = None
     vector: dict[str, float] = Field(default_factory=dict)
@@ -379,6 +430,73 @@ class LifecycleAssessment(BaseModel):
     silence_threshold_seconds: float | None = None
 
 
+# --------------------------------------------------------------------------
+# Stage 1: Timeline, Contradictions, Candidates, Relations & Material Delta
+# --------------------------------------------------------------------------
+
+
+class TimelineEntry(BaseModel):
+    """Stage 1 section 8/12: Recorded milestone or causal evidence on the event timeline."""
+
+    entry_id: str = Field(default_factory=lambda: new_id("tle"))
+    event_id: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    event_kind: EventKind = EventKind.INCIDENT
+    phase: EventPhase = EventPhase.ACTIVE
+    headline: str
+    detail: str = ""
+    evidence_observation_ids: tuple[str, ...] = ()
+    causal_factor: str = ""
+
+
+class Contradiction(BaseModel):
+    """Stage 1 section 6/10: Conflicting claims (e.g. road open vs closed)."""
+
+    contradiction_id: str = Field(default_factory=lambda: new_id("ctr"))
+    event_id: str
+    predicate: str
+    claim_id_a: str
+    claim_id_b: str
+    value_a: Any = None
+    value_b: Any = None
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    resolved: bool = False
+
+
+class CorrelationCandidate(BaseModel):
+    """Stage 1 section 6/12: POSSIBLE match candidate for review queue."""
+
+    candidate_id: str = Field(default_factory=lambda: new_id("can"))
+    observation_id: str
+    event_id: str
+    score: float
+    reasons: tuple[str, ...] = ()
+    decision: MatchDecision = MatchDecision.POSSIBLE
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    status: str = "pending"  # pending | approved | rejected
+
+
+class EventRelation(BaseModel):
+    """Stage 1 section 7/10: Parent/child, caused, merged_into, split_from relations."""
+
+    parent_event_id: str
+    child_event_id: str
+    relation_type: str = "parent_child"
+    linked_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class MaterialChangeRecord(BaseModel):
+    """Stage 1 section 13: Interface to Stage 2 - material change stream."""
+
+    event_id: str
+    version: int
+    changed_fields: tuple[str, ...] = ()
+    change_flags: tuple[str, ...] = ()
+    is_material: bool = False
+    reason: str = ""
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class EventState(BaseModel):
     """A point-in-time reconstruction. Never overwritten - a new version is written."""
 
@@ -387,6 +505,11 @@ class EventState(BaseModel):
     event_id: str
     schema_version: str = SCHEMA_VERSION
     state_version: int = 1
+
+    kind: EventKind = EventKind.INCIDENT
+    phase: EventPhase = EventPhase.ACTIVE
+    parent_event_id: str | None = None
+    child_event_ids: tuple[str, ...] = ()
 
     event_type_distribution: dict[str, float] = Field(default_factory=dict)
     status: Literal["candidate", "active", "quiescent", "closed"] = "candidate"
@@ -410,11 +533,17 @@ class EventState(BaseModel):
     #: Why this event is active/quiescent/closed, with its evidence.
     lifecycle: LifecycleAssessment = Field(default_factory=LifecycleAssessment)
 
+    trajectory: SituationTrajectory | None = None
+    escalation_factors: tuple[str, ...] = ()
+    timeline: tuple[TimelineEntry, ...] = ()
+    contradictions: tuple[Contradiction, ...] = ()
+
     observation_ids: tuple[str, ...] = ()
     claim_ids: tuple[str, ...] = ()
 
     feature_vector_version: str = SCHEMA_VERSION
     derived: dict[str, float] = Field(default_factory=dict)
+
 
 
 # --------------------------------------------------------------------------

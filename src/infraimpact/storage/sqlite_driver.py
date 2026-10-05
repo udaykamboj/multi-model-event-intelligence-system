@@ -19,31 +19,42 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..domain.enums import EventKind, EventPhase, MatchDecision
 from ..domain.geo import bbox_of, centroid_of
-from ..domain.ids import ensure_utc
+from ..domain.ids import ensure_utc, new_id
 from ..domain.schemas import (
     AnalysisRun,
     Claim,
+    Contradiction,
+    CorrelationCandidate,
     EventLifecycleTransition,
+    EventRelation,
     EventState,
+    MaterialChangeRecord,
     NotificationCandidate,
     Observation,
     RouteProfile,
     SavedPlace,
     SourceHealth,
+    SourceRecord,
     StateDeltaRecord,
+    TimelineEntry,
     UserContext,
     WorldSnapshot,
 )
 from .repository import (
     AnalysisRunRepository,
     ClaimRepository,
+    ContradictionRepository,
+    CorrelationCandidateRepository,
     EventLifecycleRepository,
     EventRepository,
+    MaterialChangeRepository,
     NotificationRepository,
     ObservationRepository,
     PlatformRepository,
     SourceHealthRepository,
+    SourceRecordRepository,
     StateDeltaRepository,
     StateRepository,
     UserImpactRepository,
@@ -60,11 +71,15 @@ CREATE TABLE IF NOT EXISTS observations (
     schema_version       TEXT NOT NULL,
     source_id            TEXT NOT NULL,
     source_record_id     TEXT,
-    event_time           TEXT NOT NULL,
+    event_time           TEXT,
+    event_time_confidence TEXT NOT NULL DEFAULT 'known',
+    published_at         TEXT,
     observed_at          TEXT NOT NULL,
     ingested_at          TEXT NOT NULL,
     source_type          TEXT NOT NULL,
     observation_type     TEXT NOT NULL,
+    significance_class   TEXT NOT NULL DEFAULT 'event_candidate',
+    version              INTEGER NOT NULL DEFAULT 1,
     authority            TEXT NOT NULL,
     headline             TEXT NOT NULL DEFAULT '',
     geometry             TEXT,
@@ -84,28 +99,103 @@ CREATE TABLE IF NOT EXISTS observations (
     payload_hash         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_obs_time ON observations(observed_at DESC);
--- event_time, not observed_at: candidate generation resolves an observation to an
--- event by *when the thing happened*, and observed_at is when the platform saw it.
--- The two diverge sharply for replayed snapshots, so an observed_at index would
--- make every cold replay scan the whole ledger. observed_at keeps its own index
--- above for the freshness and staleness queries, which genuinely want it.
 CREATE INDEX IF NOT EXISTS idx_obs_event_time ON observations(event_time);
 CREATE INDEX IF NOT EXISTS idx_obs_source ON observations(source_id, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_type ON observations(observation_type, observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_geo ON observations(min_lon, max_lon, min_lat, max_lat);
 
 CREATE TABLE IF NOT EXISTS events (
-    event_id       TEXT PRIMARY KEY,
-    region_id      TEXT NOT NULL,
-    status         TEXT NOT NULL DEFAULT 'candidate',
-    first_observed TEXT,
-    last_observed  TEXT,
-    closed_at      TEXT,
-    close_reason   TEXT,
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    event_id        TEXT PRIMARY KEY,
+    region_id       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'candidate',
+    kind            TEXT NOT NULL DEFAULT 'incident',
+    phase           TEXT NOT NULL DEFAULT 'active',
+    parent_event_id TEXT,
+    first_observed  TEXT,
+    last_observed   TEXT,
+    closed_at       TEXT,
+    close_reason    TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS source_records (
+    source_id        TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    fingerprint      TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1,
+    first_seen       TEXT NOT NULL,
+    last_confirmed   TEXT NOT NULL,
+    missed_polls     INTEGER NOT NULL DEFAULT 0,
+    is_active        INTEGER NOT NULL DEFAULT 1,
+    ended_at         TEXT,
+    PRIMARY KEY (source_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sr_source ON source_records(source_id, is_active);
+
+CREATE TABLE IF NOT EXISTS correlation_candidates (
+    candidate_id     TEXT PRIMARY KEY,
+    observation_id   TEXT NOT NULL,
+    event_id         TEXT NOT NULL,
+    score            REAL NOT NULL,
+    reasons          TEXT NOT NULL DEFAULT '[]',
+    decision         TEXT NOT NULL DEFAULT 'possible',
+    created_at       TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS idx_candidates_status ON correlation_candidates(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_candidates_event ON correlation_candidates(event_id);
+
+CREATE TABLE IF NOT EXISTS contradictions (
+    contradiction_id TEXT PRIMARY KEY,
+    event_id         TEXT NOT NULL,
+    predicate        TEXT NOT NULL,
+    claim_id_a       TEXT NOT NULL,
+    claim_id_b       TEXT NOT NULL,
+    value_a          TEXT,
+    value_b          TEXT,
+    detected_at      TEXT NOT NULL,
+    resolved         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_contradictions_event ON contradictions(event_id, resolved);
+
+CREATE TABLE IF NOT EXISTS event_relations (
+    parent_event_id  TEXT NOT NULL,
+    child_event_id   TEXT NOT NULL,
+    relation_type    TEXT NOT NULL DEFAULT 'parent_child',
+    linked_at        TEXT NOT NULL,
+    PRIMARY KEY (parent_event_id, child_event_id, relation_type)
+);
+CREATE INDEX IF NOT EXISTS idx_rel_parent ON event_relations(parent_event_id);
+CREATE INDEX IF NOT EXISTS idx_rel_child ON event_relations(child_event_id);
+
+CREATE TABLE IF NOT EXISTS timeline_entries (
+    entry_id                  TEXT PRIMARY KEY,
+    event_id                  TEXT NOT NULL,
+    timestamp                 TEXT NOT NULL,
+    event_kind                TEXT NOT NULL DEFAULT 'incident',
+    phase                     TEXT NOT NULL DEFAULT 'active',
+    headline                  TEXT NOT NULL,
+    detail                    TEXT NOT NULL DEFAULT '',
+    evidence_observation_ids  TEXT NOT NULL DEFAULT '[]',
+    causal_factor             TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_tle_event ON timeline_entries(event_id, timestamp ASC);
+
+CREATE TABLE IF NOT EXISTS material_changes (
+    change_id        TEXT PRIMARY KEY,
+    event_id         TEXT NOT NULL,
+    version          INTEGER NOT NULL,
+    changed_fields   TEXT NOT NULL DEFAULT '[]',
+    change_flags     TEXT NOT NULL DEFAULT '[]',
+    is_material      INTEGER NOT NULL DEFAULT 0,
+    reason           TEXT NOT NULL DEFAULT '',
+    recorded_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mat_changes ON material_changes(event_id, version);
+CREATE INDEX IF NOT EXISTS idx_mat_feed ON material_changes(is_material, recorded_at DESC);
+
 
 CREATE TABLE IF NOT EXISTS event_observations (
     event_id       TEXT NOT NULL,
@@ -475,25 +565,32 @@ class SqliteObservationRepository(_SqliteRepo, ObservationRepository):
     def append(self, observation: Observation) -> bool:
         bounds = bbox_of(observation.geometry)
         centre = centroid_of(observation.geometry)
+        event_time_str = observation.event_time.isoformat() if observation.event_time else None
+        published_at_str = observation.published_at.isoformat() if observation.published_at else None
         try:
             self._execute(
                 """INSERT INTO observations (
                     observation_id, schema_version, source_id, source_record_id,
-                    event_time, observed_at, ingested_at, source_type, observation_type,
+                    event_time, event_time_confidence, published_at, observed_at, ingested_at,
+                    source_type, observation_type, significance_class, version,
                     authority, headline, geometry, min_lon, min_lat, max_lon, max_lat,
                     centroid_lon, centroid_lat, location_precision_m, structured_payload,
                     provenance, quality, source_url, raw_payload_uri, dedupe_key, payload_hash
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     observation.observation_id,
                     observation.schema_version,
                     observation.source_id,
                     observation.source_record_id,
-                    observation.event_time.isoformat(),
+                    event_time_str,
+                    observation.event_time_confidence,
+                    published_at_str,
                     observation.observed_at.isoformat(),
                     observation.ingested_at.isoformat(),
                     str(observation.source_type),
                     str(observation.observation_type),
+                    str(observation.significance_class),
+                    observation.version,
                     str(observation.provenance.authority),
                     observation.headline,
                     json.dumps(observation.geometry) if observation.geometry else None,
@@ -544,6 +641,18 @@ class SqliteObservationRepository(_SqliteRepo, ObservationRepository):
         )
         return [r["event_id"] for r in rows]
 
+    def find_event_for_source_record(self, source_id: str, source_record_id: str) -> str | None:
+        if not source_record_id:
+            return None
+        rows = self._query(
+            """SELECT eo.event_id FROM observations o
+               JOIN event_observations eo ON eo.observation_id = o.observation_id
+               WHERE o.source_id = ? AND o.source_record_id = ?
+               ORDER BY o.observed_at DESC LIMIT 1""",
+            (source_id, source_record_id),
+        )
+        return rows[0]["event_id"] if rows else None
+
     def list_between(
         self, start: datetime, end: datetime, region_id: str | None = None
     ) -> list[Observation]:
@@ -571,17 +680,139 @@ class SqliteObservationRepository(_SqliteRepo, ObservationRepository):
 
 
 class SqliteEventRepository(_SqliteRepo, EventRepository):
-    def ensure(self, event_id: str, first_observed: datetime, region_id: str) -> None:
+    def ensure(
+        self,
+        event_id: str,
+        first_observed: datetime,
+        region_id: str,
+        kind: EventKind = EventKind.INCIDENT,
+        phase: EventPhase = EventPhase.ACTIVE,
+        parent_event_id: str | None = None,
+    ) -> None:
         self._execute(
-            """INSERT INTO events (event_id, region_id, status, first_observed, created_at, updated_at)
-               VALUES (?,?,'candidate',?,?,?)
+            """INSERT INTO events (event_id, region_id, status, kind, phase, parent_event_id, first_observed, created_at, updated_at)
+               VALUES (?,?,'candidate',?,?,?,?,?,?)
                ON CONFLICT(event_id) DO UPDATE SET last_observed=excluded.last_observed,
                                                    updated_at=excluded.updated_at""",
-            (event_id, region_id, first_observed.isoformat(), datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+            (
+                event_id,
+                region_id,
+                str(kind),
+                str(phase),
+                parent_event_id,
+                first_observed.isoformat(),
+                datetime.now(UTC).isoformat(),
+                datetime.now(UTC).isoformat(),
+            ),
         )
 
-    def create(self, event_id: str, first_observed: datetime, region_id: str) -> None:
-        self.ensure(event_id, first_observed, region_id)
+    def create(
+        self,
+        event_id: str,
+        first_observed: datetime,
+        region_id: str,
+        kind: EventKind = EventKind.INCIDENT,
+        phase: EventPhase = EventPhase.ACTIVE,
+        parent_event_id: str | None = None,
+    ) -> None:
+        self.ensure(event_id, first_observed, region_id, kind=kind, phase=phase, parent_event_id=parent_event_id)
+
+    def set_kind(self, event_id: str, kind: EventKind) -> None:
+        self._execute(
+            "UPDATE events SET kind=?, updated_at=? WHERE event_id=?",
+            (str(kind), datetime.now(UTC).isoformat(), event_id),
+        )
+
+    def kind_of(self, event_id: str) -> EventKind:
+        rows = self._query("SELECT kind FROM events WHERE event_id=?", (event_id,))
+        if rows and rows[0]["kind"]:
+            try:
+                return EventKind(rows[0]["kind"])
+            except ValueError:
+                pass
+        return EventKind.INCIDENT
+
+    def set_phase(self, event_id: str, phase: EventPhase) -> None:
+        self._execute(
+            "UPDATE events SET phase=?, updated_at=? WHERE event_id=?",
+            (str(phase), datetime.now(UTC).isoformat(), event_id),
+        )
+
+    def phase_of(self, event_id: str) -> EventPhase:
+        rows = self._query("SELECT phase FROM events WHERE event_id=?", (event_id,))
+        if rows and rows[0]["phase"]:
+            try:
+                return EventPhase(rows[0]["phase"])
+            except ValueError:
+                pass
+        return EventPhase.ACTIVE
+
+    def add_relation(self, relation: EventRelation) -> None:
+        self._execute(
+            """INSERT INTO event_relations (parent_event_id, child_event_id, relation_type, linked_at)
+               VALUES (?,?,?,?) ON CONFLICT DO NOTHING""",
+            (
+                relation.parent_event_id,
+                relation.child_event_id,
+                relation.relation_type,
+                ensure_utc(relation.linked_at).isoformat(),
+            ),
+        )
+
+    def relations_for(self, event_id: str) -> list[EventRelation]:
+        rows = self._query(
+            "SELECT * FROM event_relations WHERE parent_event_id=? OR child_event_id=?",
+            (event_id, event_id),
+        )
+        return [
+            EventRelation(
+                parent_event_id=r["parent_event_id"],
+                child_event_id=r["child_event_id"],
+                relation_type=r["relation_type"],
+                linked_at=datetime.fromisoformat(r["linked_at"]),
+            )
+            for r in rows
+        ]
+
+    def add_timeline_entry(self, entry: TimelineEntry) -> None:
+        self._execute(
+            """INSERT INTO timeline_entries (
+                entry_id, event_id, timestamp, event_kind, phase, headline, detail,
+                evidence_observation_ids, causal_factor
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(entry_id) DO NOTHING""",
+            (
+                entry.entry_id,
+                entry.event_id,
+                ensure_utc(entry.timestamp).isoformat(),
+                str(entry.event_kind),
+                str(entry.phase),
+                entry.headline,
+                entry.detail,
+                json.dumps(list(entry.evidence_observation_ids)),
+                entry.causal_factor,
+            ),
+        )
+
+    def timeline_for(self, event_id: str) -> list[TimelineEntry]:
+        rows = self._query(
+            "SELECT * FROM timeline_entries WHERE event_id=? ORDER BY timestamp ASC",
+            (event_id,),
+        )
+        return [
+            TimelineEntry(
+                entry_id=r["entry_id"],
+                event_id=r["event_id"],
+                timestamp=datetime.fromisoformat(r["timestamp"]),
+                event_kind=r["event_kind"],
+                phase=r["phase"],
+                headline=r["headline"],
+                detail=r["detail"] or "",
+                evidence_observation_ids=tuple(json.loads(r["evidence_observation_ids"] or "[]")),
+                causal_factor=r["causal_factor"] or "",
+            )
+            for r in rows
+        ]
 
     def link_observation(self, event_id: str, observation_id: str) -> None:
         self._execute(
@@ -597,15 +828,6 @@ class SqliteEventRepository(_SqliteRepo, EventRepository):
         return [r["observation_id"] for r in rows]
 
     def event_for_observation(self, observation_id: str) -> str | None:
-        """Reverse index lookup on ``event_observations``.
-
-        Cheap because ``idx_eo_obs`` exists for exactly this. It is the check
-        that makes ingestion idempotent for events rather than merely
-        deduplicated for observations: an observation that is already attached
-        can never be attached a second time, so re-polling a feed cannot split
-        one real-world event across two ids.
-        """
-
         rows = self._query(
             "SELECT event_id FROM event_observations WHERE observation_id=? ORDER BY linked_at ASC LIMIT 1",
             (observation_id,),
@@ -628,20 +850,6 @@ class SqliteEventRepository(_SqliteRepo, EventRepository):
         return rows[0]["status"] if rows else None
 
     def set_status(self, event_id: str, status: str, at: datetime, reason: str) -> bool:
-        """Record a lifecycle status.
-
-        Status moves in both directions, so this writes ``status`` rather than
-        only ever stamping ``closed_at``. Reactivating matters: an event that has
-        gone quiet and then produces a new report is the same event, still
-        happening, and a system that can only close would have to either keep it
-        closed (silencing a live situation) or invent a new id (forking its
-        history).
-
-        ``closed_at``/``close_reason`` are cleared on reactivation so a reopened
-        event does not carry a stale end timestamp. Returns False when the event
-        row does not exist, which is the caller's signal to create it.
-        """
-
         cursor = self._execute(
             """UPDATE events
                SET status=?,
@@ -693,6 +901,312 @@ class SqliteEventRepository(_SqliteRepo, EventRepository):
                VALUES (?,?,?,?,?)""",
             (new_id("merge"), source_event_id, target_event_id, reason, datetime.now(UTC).isoformat()),
         )
+
+
+class SqliteSourceRecordRepository(_SqliteRepo, SourceRecordRepository):
+    def upsert(self, record: SourceRecord) -> None:
+        self._execute(
+            """INSERT INTO source_records (
+                source_id, source_record_id, fingerprint, version, first_seen,
+                last_confirmed, missed_polls, is_active, ended_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(source_id, source_record_id) DO UPDATE SET
+                fingerprint=excluded.fingerprint,
+                version=excluded.version,
+                last_confirmed=excluded.last_confirmed,
+                missed_polls=excluded.missed_polls,
+                is_active=excluded.is_active,
+                ended_at=excluded.ended_at""",
+            (
+                record.source_id,
+                record.source_record_id,
+                record.fingerprint,
+                record.version,
+                ensure_utc(record.first_seen).isoformat(),
+                ensure_utc(record.last_confirmed).isoformat(),
+                record.missed_polls,
+                1 if record.is_active else 0,
+                ensure_utc(record.ended_at).isoformat() if record.ended_at else None,
+            ),
+        )
+
+    def get(self, source_id: str, source_record_id: str) -> SourceRecord | None:
+        rows = self._query(
+            "SELECT * FROM source_records WHERE source_id=? AND source_record_id=?",
+            (source_id, source_record_id),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return SourceRecord(
+            source_id=r["source_id"],
+            source_record_id=r["source_record_id"],
+            fingerprint=r["fingerprint"],
+            version=r["version"],
+            first_seen=datetime.fromisoformat(r["first_seen"]),
+            last_confirmed=datetime.fromisoformat(r["last_confirmed"]),
+            missed_polls=r["missed_polls"],
+            is_active=bool(r["is_active"]),
+            ended_at=datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None,
+        )
+
+    def list_active(self, source_id: str) -> list[SourceRecord]:
+        rows = self._query(
+            "SELECT * FROM source_records WHERE source_id=? AND is_active=1",
+            (source_id,),
+        )
+        return [
+            SourceRecord(
+                source_id=r["source_id"],
+                source_record_id=r["source_record_id"],
+                fingerprint=r["fingerprint"],
+                version=r["version"],
+                first_seen=datetime.fromisoformat(r["first_seen"]),
+                last_confirmed=datetime.fromisoformat(r["last_confirmed"]),
+                missed_polls=r["missed_polls"],
+                is_active=bool(r["is_active"]),
+                ended_at=datetime.fromisoformat(r["ended_at"]) if r["ended_at"] else None,
+            )
+            for r in rows
+        ]
+
+    def confirm_present(self, source_id: str, source_record_id: str, fingerprint: str) -> tuple[bool, int]:
+        existing = self.get(source_id, source_record_id)
+        now_dt = datetime.now(UTC)
+        if existing is None:
+            new_record = SourceRecord(
+                source_id=source_id,
+                source_record_id=source_record_id,
+                fingerprint=fingerprint,
+                version=1,
+                first_seen=now_dt,
+                last_confirmed=now_dt,
+                missed_polls=0,
+                is_active=True,
+            )
+            self.upsert(new_record)
+            return (True, 1)
+
+        changed = (existing.fingerprint != fingerprint)
+        new_version = existing.version + 1 if changed else existing.version
+        updated = existing.model_copy(
+            update={
+                "fingerprint": fingerprint,
+                "version": new_version,
+                "last_confirmed": now_dt,
+                "missed_polls": 0,
+                "is_active": True,
+            }
+        )
+        self.upsert(updated)
+        return (changed, new_version)
+
+    def mark_missed(
+        self, source_id: str, missing_ids: Sequence[str], threshold: int
+    ) -> list[SourceRecord]:
+        ended: list[SourceRecord] = []
+        now_dt = datetime.now(UTC)
+        for rid in missing_ids:
+            rec = self.get(source_id, rid)
+            if not rec or not rec.is_active:
+                continue
+            missed = rec.missed_polls + 1
+            if missed >= threshold:
+                rec_ended = rec.model_copy(
+                    update={
+                        "missed_polls": missed,
+                        "is_active": False,
+                        "ended_at": now_dt,
+                    }
+                )
+                self.upsert(rec_ended)
+                ended.append(rec_ended)
+            else:
+                rec_updated = rec.model_copy(update={"missed_polls": missed})
+                self.upsert(rec_updated)
+        return ended
+
+
+class SqliteCorrelationCandidateRepository(_SqliteRepo, CorrelationCandidateRepository):
+    def append(self, candidate: CorrelationCandidate) -> None:
+        self._execute(
+            """INSERT INTO correlation_candidates (
+                candidate_id, observation_id, event_id, score, reasons, decision, created_at, status
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(candidate_id) DO NOTHING""",
+            (
+                candidate.candidate_id,
+                candidate.observation_id,
+                candidate.event_id,
+                candidate.score,
+                json.dumps(list(candidate.reasons)),
+                str(candidate.decision),
+                ensure_utc(candidate.created_at).isoformat(),
+                candidate.status,
+            ),
+        )
+
+    def list_pending(self, limit: int = 100) -> list[CorrelationCandidate]:
+        rows = self._query(
+            "SELECT * FROM correlation_candidates WHERE status='pending' ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            CorrelationCandidate(
+                candidate_id=r["candidate_id"],
+                observation_id=r["observation_id"],
+                event_id=r["event_id"],
+                score=r["score"],
+                reasons=tuple(json.loads(r["reasons"] or "[]")),
+                decision=r["decision"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                status=r["status"],
+            )
+            for r in rows
+        ]
+
+    def for_event(self, event_id: str) -> list[CorrelationCandidate]:
+        rows = self._query(
+            "SELECT * FROM correlation_candidates WHERE event_id=? ORDER BY created_at DESC",
+            (event_id,),
+        )
+        return [
+            CorrelationCandidate(
+                candidate_id=r["candidate_id"],
+                observation_id=r["observation_id"],
+                event_id=r["event_id"],
+                score=r["score"],
+                reasons=tuple(json.loads(r["reasons"] or "[]")),
+                decision=r["decision"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                status=r["status"],
+            )
+            for r in rows
+        ]
+
+    def update_status(self, candidate_id: str, status: str) -> bool:
+        cur = self._execute(
+            "UPDATE correlation_candidates SET status=? WHERE candidate_id=?",
+            (status, candidate_id),
+        )
+        return bool(cur.rowcount)
+
+
+class SqliteContradictionRepository(_SqliteRepo, ContradictionRepository):
+    def append(self, contradiction: Contradiction) -> None:
+        self._execute(
+            """INSERT INTO contradictions (
+                contradiction_id, event_id, predicate, claim_id_a, claim_id_b,
+                value_a, value_b, detected_at, resolved
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(contradiction_id) DO NOTHING""",
+            (
+                contradiction.contradiction_id,
+                contradiction.event_id,
+                contradiction.predicate,
+                contradiction.claim_id_a,
+                contradiction.claim_id_b,
+                json.dumps(contradiction.value_a, default=str),
+                json.dumps(contradiction.value_b, default=str),
+                ensure_utc(contradiction.detected_at).isoformat(),
+                1 if contradiction.resolved else 0,
+            ),
+        )
+
+    def for_event(self, event_id: str) -> list[Contradiction]:
+        rows = self._query(
+            "SELECT * FROM contradictions WHERE event_id=? ORDER BY detected_at DESC",
+            (event_id,),
+        )
+        return [
+            Contradiction(
+                contradiction_id=r["contradiction_id"],
+                event_id=r["event_id"],
+                predicate=r["predicate"],
+                claim_id_a=r["claim_id_a"],
+                claim_id_b=r["claim_id_b"],
+                value_a=_json_or_none(r["value_a"]),
+                value_b=_json_or_none(r["value_b"]),
+                detected_at=datetime.fromisoformat(r["detected_at"]),
+                resolved=bool(r["resolved"]),
+            )
+            for r in rows
+        ]
+
+    def unresolved(self, limit: int = 100) -> list[Contradiction]:
+        rows = self._query(
+            "SELECT * FROM contradictions WHERE resolved=0 ORDER BY detected_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            Contradiction(
+                contradiction_id=r["contradiction_id"],
+                event_id=r["event_id"],
+                predicate=r["predicate"],
+                claim_id_a=r["claim_id_a"],
+                claim_id_b=r["claim_id_b"],
+                value_a=_json_or_none(r["value_a"]),
+                value_b=_json_or_none(r["value_b"]),
+                detected_at=datetime.fromisoformat(r["detected_at"]),
+                resolved=bool(r["resolved"]),
+            )
+            for r in rows
+        ]
+
+
+class SqliteMaterialChangeRepository(_SqliteRepo, MaterialChangeRepository):
+    def append(self, record: MaterialChangeRecord) -> None:
+        self._execute(
+            """INSERT INTO material_changes (
+                change_id, event_id, version, changed_fields, change_flags, is_material, reason, recorded_at
+            ) VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                new_id("mat"),
+                record.event_id,
+                record.version,
+                json.dumps(list(record.changed_fields)),
+                json.dumps(list(record.change_flags)),
+                1 if record.is_material else 0,
+                record.reason,
+                ensure_utc(record.recorded_at).isoformat(),
+            ),
+        )
+
+    def list_for_event(self, event_id: str) -> list[MaterialChangeRecord]:
+        rows = self._query(
+            "SELECT * FROM material_changes WHERE event_id=? ORDER BY version ASC",
+            (event_id,),
+        )
+        return [
+            MaterialChangeRecord(
+                event_id=r["event_id"],
+                version=r["version"],
+                changed_fields=tuple(json.loads(r["changed_fields"] or "[]")),
+                change_flags=tuple(json.loads(r["change_flags"] or "[]")),
+                is_material=bool(r["is_material"]),
+                reason=r["reason"] or "",
+                recorded_at=datetime.fromisoformat(r["recorded_at"]),
+            )
+            for r in rows
+        ]
+
+    def list_recent(self, limit: int = 50) -> list[MaterialChangeRecord]:
+        rows = self._query(
+            "SELECT * FROM material_changes WHERE is_material=1 ORDER BY recorded_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            MaterialChangeRecord(
+                event_id=r["event_id"],
+                version=r["version"],
+                changed_fields=tuple(json.loads(r["changed_fields"] or "[]")),
+                change_flags=tuple(json.loads(r["change_flags"] or "[]")),
+                is_material=bool(r["is_material"]),
+                reason=r["reason"] or "",
+                recorded_at=datetime.fromisoformat(r["recorded_at"]),
+            )
+            for r in rows
+        ]
 
 
 class SqliteStateRepository(_SqliteRepo, StateRepository):
@@ -1240,6 +1754,15 @@ class SqlitePlatformRepository(PlatformRepository):
             self._conn.executescript(SCHEMA)
             # Backfill anything an older dev database is missing.
             _ensure_column(self._conn, "event_states", "reconstructed_at", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(self._conn, "events", "kind", "TEXT NOT NULL DEFAULT 'incident'")
+            _ensure_column(self._conn, "events", "phase", "TEXT NOT NULL DEFAULT 'active'")
+            _ensure_column(self._conn, "events", "parent_event_id", "TEXT")
+            _ensure_column(self._conn, "observations", "published_at", "TEXT")
+            _ensure_column(self._conn, "observations", "event_time_confidence", "TEXT NOT NULL DEFAULT 'known'")
+            _ensure_column(self._conn, "observations", "significance_class", "TEXT NOT NULL DEFAULT 'event_candidate'")
+            _ensure_column(self._conn, "observations", "version", "INTEGER NOT NULL DEFAULT 1")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_significance ON observations(significance_class, observed_at DESC)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind_phase ON events(kind, phase, updated_at DESC)")
             self._conn.commit()
 
         #: Shared across every sub-repository on this connection. See
@@ -1259,6 +1782,10 @@ class SqlitePlatformRepository(PlatformRepository):
         self.user_impacts = SqliteUserImpactRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.notifications = SqliteNotificationRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.source_health = SqliteSourceHealthRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.source_records = SqliteSourceRecordRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.candidates = SqliteCorrelationCandidateRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.contradictions = SqliteContradictionRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.material_changes = SqliteMaterialChangeRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         _ = base
 
     @contextmanager
@@ -1323,18 +1850,23 @@ def _row_to_observation(row: sqlite3.Row) -> Observation:
     geom = _json.loads(row["geometry"]) if row["geometry"] else None
     c = centroid_of(geom) if geom else None
     centroid = (round(c[0], 6), round(c[1], 6)) if c else None
-    event_id = row["event_id"] if "event_id" in row.keys() and row["event_id"] else None
+    row_keys = row.keys()
+    event_id = row["event_id"] if "event_id" in row_keys and row["event_id"] else None
 
     return Observation(
         observation_id=row["observation_id"],
         schema_version=row["schema_version"],
         source_id=row["source_id"],
         source_record_id=row["source_record_id"] or "",
-        event_time=row["event_time"],
+        event_time=row["event_time"] if row["event_time"] else None,
+        event_time_confidence=row["event_time_confidence"] if "event_time_confidence" in row_keys else "known",
+        published_at=row["published_at"] if "published_at" in row_keys and row["published_at"] else None,
         observed_at=row["observed_at"],
         ingested_at=row["ingested_at"],
         source_type=row["source_type"],
         observation_type=row["observation_type"],
+        significance_class=row["significance_class"] if "significance_class" in row_keys else "event_candidate",
+        version=row["version"] if "version" in row_keys else 1,
         geometry=geom,
         location_precision_m=row["location_precision_m"],
         headline=row["headline"],
@@ -1346,6 +1878,7 @@ def _row_to_observation(row: sqlite3.Row) -> Observation:
         centroid=centroid,
         event_id=event_id,
     )
+
 
 
 

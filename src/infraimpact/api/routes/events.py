@@ -28,6 +28,7 @@ from ..schemas import (
     EventSummary,
     ForecastResponse,
     RecentChange,
+    ReviewQueueResponse,
     TimelineEntry,
     TimelineResponse,
 )
@@ -45,6 +46,9 @@ def _summary_from_row(row: dict[str, Any]) -> EventSummary:
         event_id=row["event_id"],
         status=row.get("status", "active"),
         region_id=row.get("region_id", ""),
+        kind=row.get("kind", "incident"),
+        phase=row.get("phase", "active"),
+        parent_event_id=row.get("parent_event_id"),
         first_observed=_maybe_dt(row.get("first_observed")),
         updated_at=_maybe_dt(row.get("updated_at")),
         closed_at=_maybe_dt(row.get("closed_at")),
@@ -123,9 +127,16 @@ def _populate_summary_details(summary: EventSummary, state: EventState | None, r
     if state is not None:
         updates["state_version"] = state.state_version
         updates["last_reconstructed_at"] = state.reconstructed_at
-        updates["source_count"] = max(1, state.evidence.source_count)
-        updates["independent_source_count"] = max(1, state.evidence.independent_source_count)
-        updates["confidence"] = state.evidence.vector.get("corroboration_score", state.geometry_confidence) or 0.6
+        updates["kind"] = state.kind.value
+        updates["phase"] = state.phase.value
+        updates["parent_event_id"] = state.parent_event_id
+        if state.evidence:
+            updates["source_count"] = max(1, state.evidence.source_count)
+            updates["independent_source_count"] = max(1, state.evidence.independent_source_count)
+            updates["distinct_document_count"] = max(1, state.evidence.distinct_document_count)
+            updates["source_family_count"] = max(1, state.evidence.source_family_count)
+            updates["observation_count"] = state.evidence.observation_count or len(state.observation_ids)
+            updates["confidence"] = state.evidence.vector.get("event_confidence", state.evidence.vector.get("corroboration_score", state.geometry_confidence)) or 0.75
         updates["geometry"] = state.geometry
         if state.event_type_distribution:
             updates["dominant_type"] = max(state.event_type_distribution.items(), key=lambda kv: kv[1])[0]
@@ -176,17 +187,53 @@ def _populate_summary_details(summary: EventSummary, state: EventState | None, r
 # --------------------------------------------------------------------------
 
 
+@router.get("/review/queue", response_model=ReviewQueueResponse)
+async def get_review_queue(repo: RepoDep) -> ReviewQueueResponse:
+    """Stage 1 section 12: Review queue for POSSIBLE matches and CONFLICT contradictions."""
+    candidates = (
+        [c.model_dump(mode="json") for c in repo.candidates.list_pending(limit=100)]
+        if hasattr(repo, "candidates")
+        else []
+    )
+    contradictions = (
+        [c.model_dump(mode="json") for c in repo.contradictions.unresolved(limit=100)]
+        if hasattr(repo, "contradictions")
+        else []
+    )
+    return ReviewQueueResponse(
+        candidates=candidates,
+        contradictions=contradictions,
+        total_pending=len(candidates) + len(contradictions),
+    )
+
+
+@router.post("/review/candidate/{candidate_id}")
+async def review_candidate(candidate_id: str, action: str, repo: RepoDep) -> dict[str, Any]:
+    """Approve or reject a correlation candidate from the review queue."""
+    status = "approved" if action in ("approve", "approved") else "rejected"
+    success = repo.candidates.update_status(candidate_id, status) if hasattr(repo, "candidates") else False
+    if not success:
+        raise HTTPException(status_code=404, detail=f"candidate {candidate_id} not found")
+    return {"candidate_id": candidate_id, "status": status, "success": True}
+
+
 @router.get("", response_model=EventListResponse, responses={404: {"model": ErrorResponse}})
 async def list_events(
     repo: RepoDep,
     status: str | None = Query(default=None, description="active, closed, or omit for all"),
+    kind: str | None = Query(default=None, description="incident, condition, situation"),
+    phase: str | None = Query(default=None, description="scheduled, active, ended, historical"),
     limit: int = Query(default=50, ge=1, le=500),
     since: str | None = Query(default=None, description="ISO-8601 updated_at lower bound"),
 ) -> EventListResponse:
-    """Newest-first event list."""
+    """Newest-first event list with kind and phase filtering."""
     rows = repo.events.all_events()
     if status:
         rows = [r for r in rows if r.get("status") == status]
+    if kind:
+        rows = [r for r in rows if r.get("kind") == kind]
+    if phase:
+        rows = [r for r in rows if r.get("phase") == phase]
     if since:
         cutoff = parse_time(since)
         if cutoff is None:
@@ -209,13 +256,38 @@ async def list_events(
     responses={404: {"model": ErrorResponse}},
 )
 async def get_event(event_id: str, repo: RepoDep) -> EventDetail:
-    """The section 51 response shape."""
+    """The section 51 response shape extended with Stage 1 provenance."""
     row = _event_row(repo, event_id)
     summary = _summary_from_row(row)
     state = repo.states.latest(event_id)
     summary = _populate_summary_details(summary, state, repo)
     run = repo.runs.latest_for_event(event_id)
 
+    timeline_entries = [
+        t.model_dump(mode="json") for t in repo.events.timeline_for(event_id)
+    ]
+    contradictions = [
+        c.model_dump(mode="json")
+        for c in (repo.contradictions.for_event(event_id) if hasattr(repo, "contradictions") else [])
+    ]
+    candidates = [
+        c.model_dump(mode="json")
+        for c in (repo.candidates.for_event(event_id) if hasattr(repo, "candidates") else [])
+    ]
+    relations = [
+        r.model_dump(mode="json")
+        for r in repo.events.relations_for(event_id)
+    ]
+
+    summary = summary.model_copy(update={
+        "timeline_entries": timeline_entries,
+        "contradictions": contradictions,
+        "candidates": candidates,
+        "relations": relations,
+        "trajectory": state.trajectory.value if (state and state.trajectory) else None,
+        "escalation_factors": list(state.escalation_factors) if (state and state.escalation_factors) else [],
+        "child_event_ids": list(state.child_event_ids) if (state and state.child_event_ids) else [],
+    })
 
     return EventDetail(
         event=summary,

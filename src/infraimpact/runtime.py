@@ -47,11 +47,20 @@ from .analysis.orchestrator import AnalysisOrchestrator, AnalysisOutcome
 from .bus.event_bus import Envelope, EventBus, Topic
 from .config import Settings, get_region, get_settings, workspace_root
 from .delta.engine import DeltaReport, StateDeltaEngine, compare_user_exposure
-from .domain.enums import NotificationReason, TruthStatus, Urgency
+from .domain.enums import (
+    EventKind,
+    EventPhase,
+    NotificationReason,
+    SituationTrajectory,
+    TruthStatus,
+    Urgency,
+)
+from .domain.geo import distance_m
 from .domain.ids import utcnow
 from .domain.schemas import (
     EventLifecycleTransition,
     EventState,
+    MaterialChangeRecord,
     NotificationCandidate,
     Observation,
     StateDelta,
@@ -63,6 +72,7 @@ from .domain.schemas import (
 )
 from .events.claims import ClaimExtractor, RuleClaimExtractor
 from .events.resolver import EventResolver
+from .events.situation import SituationEngine
 from .events.world_state import WorldStateEngine
 from .graph.model import InfrastructureGraph, build_puget_sound_graph
 from .ingestion.pipeline import IngestResult, IngestionPipeline
@@ -203,11 +213,14 @@ class Runtime:
             states=self.repo.states,
             region_id=self.region.region_id,
             lifecycle=self.repo.lifecycle,
+            candidates=self.repo.candidates,
+            contradictions=self.repo.contradictions,
             time_window_min=self.settings.resolver_time_window_min,
             search_radius_m=self.settings.resolver_search_radius_m,
             merge_threshold=self.settings.resolver_merge_threshold,
         )
         self.world = WorldStateEngine(self.repo.states)
+        self.situation_engine = SituationEngine(self.repo, self.region.region_id)
         #: Delta engine used for the durable delta ledger. The orchestrator has
         #: its own copy for analysis runs; this one exists because deltas must be
         #: written even when no analysis runs at all - an event can be updated
@@ -384,6 +397,16 @@ class Runtime:
                 for reason, count in outcome.suppressed.items():
                     result.suppression[reason] = result.suppression.get(reason, 0) + count
 
+        # Stage 1 section 7: Compound parent Situations & trajectory evaluation
+        try:
+            situation_ids = self.situation_engine.evaluate()
+            for sit_id in situation_ids:
+                sit_outcome = await self._process_event(sit_id)
+                if sit_outcome is not None:
+                    result.events.append(sit_outcome)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("situation evaluation failed: %r", exc)
+
         # The world view is assembled once, after every event has been processed
         # and the ledger has settled. Building it per event would describe a
         # half-updated world; not rebuilding it would leave a snapshot that goes
@@ -474,6 +497,9 @@ class Runtime:
         # same event, and a replayed observation adds nothing.
         existing_claims = self.repo.claims.claims_for_observation(observation_id)
         resolution = self.resolver.resolve(observation, existing_claims)
+        if not resolution or not resolution.event_id:
+            log.debug("observation %s not correlated to an event: %s", observation_id, resolution.reason if resolution else "filtered")
+            return
         self._resolutions[resolution.event_id] = resolution
         self._dirty.add(resolution.event_id)
 
@@ -571,16 +597,29 @@ class Runtime:
         # previous_state = load_current_state(event)
         previous = self.repo.states.latest(event_id)
 
+        kind = self.repo.events.kind_of(event_id)
+        phase = self.repo.events.phase_of(event_id)
+        relations = self.repo.events.relations_for(event_id)
+        timeline = self.repo.events.timeline_for(event_id)
+        contradictions = self.repo.contradictions.for_event(event_id) if hasattr(self.repo, "contradictions") else []
+        parent_id = next((r.parent_event_id for r in relations if r.child_event_id == event_id), None)
+        child_ids = tuple(r.child_event_id for r in relations if r.parent_event_id == event_id)
+
         # new_state = rebuild_state(event, all_relevant_observations)
-        #
-        # The state version, the deltas that explain it, and the lifecycle
-        # transition it may have caused are written together or not at all.
-        # Separating them lets a crash produce the worst possible outcome: a
-        # state version asserting something that never happened, or deltas
-        # describing a change to a state version that does not exist. Both
-        # states are readable and would both be believed.
         with self.repo.transaction():
-            state = self.world.rebuild(event_id, observations, claims, previous, now=utcnow())
+            state = self.world.rebuild(
+                event_id,
+                observations,
+                claims,
+                previous,
+                now=utcnow(),
+                kind=kind,
+                phase=phase,
+                parent_event_id=parent_id,
+                child_event_ids=child_ids,
+                timeline=timeline,
+                contradictions=contradictions,
+            )
             delta_report = self._persist_state_version(
                 event_id, previous, state, observations, claims
             )
@@ -705,6 +744,50 @@ class Runtime:
         ]
         if records:
             self.repo.deltas.append_many(records)
+
+        # Stage 1 section 13: Interface to Stage 2 material changes stream
+        change_flags: list[str] = []
+        changed_fields: list[str] = [d.change for d in report.deltas]
+        if previous is None:
+            change_flags.append("created")
+        else:
+            if previous.phase != state.phase:
+                change_flags.append("phase_changed")
+            if (
+                previous.geometry
+                and state.geometry
+                and distance_m(previous.geometry, state.geometry) > 500.0
+            ):
+                change_flags.append("location_moved")
+            prev_domains = {a.domain for a in previous.affected_infrastructure}
+            new_domains = {a.domain for a in state.affected_infrastructure}
+            if new_domains - prev_domains:
+                change_flags.append("new_impact_domain")
+            if state.trajectory == SituationTrajectory.ESCALATING:
+                change_flags.append("escalated")
+            elif state.trajectory == SituationTrajectory.DE_ESCALATING:
+                change_flags.append("de_escalated")
+            if state.phase in (EventPhase.ENDED, EventPhase.HISTORICAL) or state.status == "closed":
+                change_flags.append("resolved")
+            if len(state.contradictions) > len(previous.contradictions):
+                change_flags.append("contradiction")
+
+        is_material = report.is_material or bool(
+            set(change_flags) & {"created", "phase_changed", "location_moved", "new_impact_domain", "escalated", "resolved"}
+        )
+
+        if hasattr(self.repo, "material_changes"):
+            self.repo.material_changes.append(
+                MaterialChangeRecord(
+                    event_id=event_id,
+                    version=state.state_version,
+                    changed_fields=tuple(changed_fields),
+                    change_flags=tuple(change_flags),
+                    is_material=is_material,
+                    reason=f"{len(change_flags)} flags: {', '.join(change_flags)}" if change_flags else "routine delta",
+                    recorded_at=recorded_at,
+                )
+            )
 
         self._record_lifecycle(event_id, previous, state)
         return report

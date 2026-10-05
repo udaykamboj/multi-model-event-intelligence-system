@@ -13,17 +13,24 @@ from contextlib import AbstractContextManager
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
+from ..domain.enums import EventKind, EventPhase
 from ..domain.schemas import (
     AnalysisRun,
     Claim,
+    Contradiction,
+    CorrelationCandidate,
     EventLifecycleTransition,
+    EventRelation,
     EventState,
+    MaterialChangeRecord,
     NotificationCandidate,
     Observation,
     RouteProfile,
     SavedPlace,
     SourceHealth,
+    SourceRecord,
     StateDeltaRecord,
+    TimelineEntry,
     UserContext,
     WorldSnapshot,
 )
@@ -74,6 +81,10 @@ class ObservationRepository(ABC):
 
     @abstractmethod
     def count(self) -> int: ...
+
+    @abstractmethod
+    def find_event_for_source_record(self, source_id: str, source_record_id: str) -> str | None:
+        """Find the event ID linked to a prior observation of this source record."""
 
 
 class EventRepository(ABC):
@@ -130,6 +141,31 @@ class EventRepository(ABC):
 
     @abstractmethod
     def merge(self, source_event_id: str, target_event_id: str, reason: str) -> None: ...
+
+    # Stage 1: kinds, phases, relations, and timeline
+    @abstractmethod
+    def set_kind(self, event_id: str, kind: EventKind) -> None: ...
+
+    @abstractmethod
+    def kind_of(self, event_id: str) -> EventKind: ...
+
+    @abstractmethod
+    def set_phase(self, event_id: str, phase: EventPhase) -> None: ...
+
+    @abstractmethod
+    def phase_of(self, event_id: str) -> EventPhase: ...
+
+    @abstractmethod
+    def add_relation(self, relation: EventRelation) -> None: ...
+
+    @abstractmethod
+    def relations_for(self, event_id: str) -> list[EventRelation]: ...
+
+    @abstractmethod
+    def add_timeline_entry(self, entry: TimelineEntry) -> None: ...
+
+    @abstractmethod
+    def timeline_for(self, event_id: str) -> list[TimelineEntry]: ...
 
 
 class EventLifecycleRepository(ABC):
@@ -305,6 +341,78 @@ class SourceHealthRepository(ABC):
     def get(self, source_id: str) -> SourceHealth | None: ...
 
 
+# --------------------------------------------------------------------------
+# Stage 1 Repositories
+# --------------------------------------------------------------------------
+
+
+class SourceRecordRepository(ABC):
+    """Stage 1 section 2: Source record ledger, fingerprinting & disappearance."""
+
+    @abstractmethod
+    def upsert(self, record: SourceRecord) -> None: ...
+
+    @abstractmethod
+    def get(self, source_id: str, source_record_id: str) -> SourceRecord | None: ...
+
+    @abstractmethod
+    def list_active(self, source_id: str) -> list[SourceRecord]: ...
+
+    @abstractmethod
+    def confirm_present(self, source_id: str, source_record_id: str, fingerprint: str) -> tuple[bool, int]:
+        """Returns (fingerprint_changed: bool, version: int). Updates last_confirmed."""
+        ...
+
+    @abstractmethod
+    def mark_missed(
+        self, source_id: str, missing_ids: Sequence[str], threshold: int
+    ) -> list[SourceRecord]:
+        """Increments missed_polls for missing_ids. Returns records that hit threshold and were marked ended."""
+        ...
+
+
+class CorrelationCandidateRepository(ABC):
+    """Stage 1 section 6/12: Review queue for POSSIBLE matches."""
+
+    @abstractmethod
+    def append(self, candidate: CorrelationCandidate) -> None: ...
+
+    @abstractmethod
+    def list_pending(self, limit: int = 100) -> list[CorrelationCandidate]: ...
+
+    @abstractmethod
+    def for_event(self, event_id: str) -> list[CorrelationCandidate]: ...
+
+    @abstractmethod
+    def update_status(self, candidate_id: str, status: str) -> bool: ...
+
+
+class ContradictionRepository(ABC):
+    """Stage 1 section 6/10: Claims contradiction ledger."""
+
+    @abstractmethod
+    def append(self, contradiction: Contradiction) -> None: ...
+
+    @abstractmethod
+    def for_event(self, event_id: str) -> list[Contradiction]: ...
+
+    @abstractmethod
+    def unresolved(self, limit: int = 100) -> list[Contradiction]: ...
+
+
+class MaterialChangeRepository(ABC):
+    """Stage 1 section 13: Interface to Stage 2 material changes stream."""
+
+    @abstractmethod
+    def append(self, record: MaterialChangeRecord) -> None: ...
+
+    @abstractmethod
+    def list_for_event(self, event_id: str) -> list[MaterialChangeRecord]: ...
+
+    @abstractmethod
+    def list_recent(self, limit: int = 50) -> list[MaterialChangeRecord]: ...
+
+
 class PlatformRepository(ABC):
     """Aggregate root handed to the runtime."""
 
@@ -320,6 +428,11 @@ class PlatformRepository(ABC):
     user_impacts: UserImpactRepository
     notifications: NotificationRepository
     source_health: SourceHealthRepository
+    source_records: SourceRecordRepository
+    candidates: CorrelationCandidateRepository
+    contradictions: ContradictionRepository
+    material_changes: MaterialChangeRepository
+
 
     @abstractmethod
     def checkpoint(self, consumer: str, offset: str) -> None: ...

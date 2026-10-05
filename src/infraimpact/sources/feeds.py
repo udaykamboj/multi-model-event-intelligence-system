@@ -437,6 +437,7 @@ class NewsFeedAdapter(FeedAdapter):
         return self._event_time(item)
 
     def normalize(self, record: RawRecord) -> Observation:
+        item = record.payload or {}
         title_lower = (item.get("title") or "").lower()
         desc_lower = (item.get("description") or "").lower()
         combined = f"{title_lower} {desc_lower}"
@@ -467,7 +468,7 @@ class NewsFeedAdapter(FeedAdapter):
                 "raw": item,
             },
             precision_m=5000.0,
-            authority=authority,
+            authority=self.authority,
         )
 
 

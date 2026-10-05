@@ -21,12 +21,29 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Sequence
 
-from ..domain.enums import InfrastructureDomain, ObservationType
+from ..domain.enums import (
+    EventKind,
+    EventPhase,
+    InfrastructureDomain,
+    MatchDecision,
+    ObservationType,
+    SignificanceClass,
+)
 from ..domain.geo import bbox_polygon, centroid_of, distance_m, haversine_m, union_bbox
 from ..domain.ids import deterministic_id, ensure_utc, new_id, utcnow
-from ..domain.schemas import Claim, EventState, MovementState, Observation
+from ..domain.schemas import (
+    Claim,
+    Contradiction,
+    CorrelationCandidate,
+    EventState,
+    MovementState,
+    Observation,
+    TimelineEntry,
+)
 from ..llm.client import LlmClient, NullLlmClient
 from ..storage.repository import (
+    ContradictionRepository,
+    CorrelationCandidateRepository,
     EventLifecycleRepository,
     EventRepository,
     ObservationRepository,
@@ -138,13 +155,14 @@ _STOPWORDS = frozenset(
 class Resolution:
     """Outcome of resolving one observation."""
 
-    event_id: str
+    event_id: str | None
     is_new_event: bool
     score: float
     reason: str
     candidate_event_id: str | None = None
     evidence: dict[str, float] = field(default_factory=dict)
     decided_by: str = "deterministic"
+    decision: MatchDecision = MatchDecision.NEW
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -155,7 +173,68 @@ class Resolution:
             "candidate_event_id": self.candidate_event_id,
             "evidence": {k: round(v, 4) for k, v in self.evidence.items()},
             "decided_by": self.decided_by,
+            "decision": str(self.decision),
         }
+
+
+def infer_event_kind(obs: Observation) -> EventKind:
+    """Stage 1 section 3: Infer whether an observation denotes an Incident or Condition."""
+    if obs.observation_type in (
+        ObservationType.ROAD_CLOSURE,
+        ObservationType.ROAD_CONSTRUCTION,
+        ObservationType.BRIDGE_RESTRICTION,
+        ObservationType.FERRY_STATUS,
+        ObservationType.POWER_OUTAGE,
+        ObservationType.WATER_OUTAGE,
+        ObservationType.TRANSIT_SERVICE_ALERT,
+        ObservationType.TRANSIT_DELAY,
+        ObservationType.WEATHER_CONDITION,
+        ObservationType.SEVERE_WEATHER,
+        ObservationType.FLOODING,
+        ObservationType.WILDFIRE,
+    ):
+        return EventKind.CONDITION
+
+    p = obs.structured_payload or {}
+    text = f"{obs.headline or ''} {p}".lower()
+    if any(k in text for k in ("closure", "closed", "blocked", "construction", "outage", "restriction", "road work")):
+        return EventKind.CONDITION
+
+    return EventKind.INCIDENT
+
+
+def infer_initial_phase(obs: Observation, kind: EventKind) -> EventPhase:
+    """Stage 1 section 3 & 5: Determine initial phase (scheduled, active, ended, historical)."""
+    now = utcnow()
+    event_time = ensure_utc(obs.event_time) if obs.event_time else now
+
+    # Future-dated guard or schedule/permit context -> SCHEDULED
+    if event_time > now + timedelta(hours=1) or obs.significance_class == SignificanceClass.CONTEXT:
+        return EventPhase.SCHEDULED
+
+    # Stale-article guard: article published > 6 hours ago cannot create an active event -> HISTORICAL
+    if obs.published_at and (now - ensure_utc(obs.published_at)).total_seconds() > 6 * 3600:
+        return EventPhase.HISTORICAL
+
+    # Old event guard: event time > 24 hours ago -> HISTORICAL
+    if (now - event_time).total_seconds() > 24 * 3600:
+        return EventPhase.HISTORICAL
+
+    # Ended / resolution records -> ENDED
+    if _is_ended_or_resolution(obs):
+        return EventPhase.ENDED
+
+    return EventPhase.ACTIVE
+
+
+def _is_ended_or_resolution(obs: Observation) -> bool:
+    """Stage 1 section 2 & 3: Check if observation indicates an ended condition or resolution."""
+    p = obs.structured_payload or {}
+    status = str(p.get("status") or p.get("closure_type") or p.get("alert_type") or "").lower()
+    if any(k in status for k in ("ended", "closed", "cleared", "reopened", "restored", "resumed", "resolved")):
+        return True
+    headline = (obs.headline or "").lower()
+    return any(k in headline for k in ("ended", "reopened", "restored", "resumed", "cleared", "all lanes clear"))
 
 
 @dataclass
@@ -245,16 +324,18 @@ class EventResolver:
         region_id: str,
         *,
         lifecycle: EventLifecycleRepository | None = None,
+        candidates: CorrelationCandidateRepository | None = None,
+        contradictions: ContradictionRepository | None = None,
         time_window_min: float = 180.0,
         search_radius_m: float = 2500.0,
-        merge_threshold: float = 0.62,
+        merge_threshold: float = 0.65,
+        possible_threshold: float = 0.45,
         llm: LlmClient | None = None,
     ) -> None:
         self.events = events
-        #: Only consulted for closed events, so this may be None in callers that
-        #: never close anything - an absent lifecycle log means "closed for no
-        #: stated reason", which is recoverable.
         self.lifecycle = lifecycle
+        self.candidates_repo = candidates
+        self.contradictions_repo = contradictions
         self.observations = observations
         self.claims_repo = claims
         self.states = states
@@ -262,24 +343,14 @@ class EventResolver:
         self.time_window_min = time_window_min
         self.search_radius_m = search_radius_m
         self.merge_threshold = merge_threshold
+        self.possible_threshold = possible_threshold
         self.llm = llm or NullLlmClient()
-        #: Allocates event identity. See
-        #: :class:`~infraimpact.events.identity.EventIdentityAllocator` for why
-        #: the id cannot be a hash of region/type/day.
         self.identities = EventIdentityAllocator(region_id)
         from .claims import RuleClaimExtractor
 
         self.claim_extractor = RuleClaimExtractor()
-        #: Scoped to a single :meth:`resolve` call and cleared on the way out,
-        #: so it can never go stale across a burst of observations that opens new
-        #: events. An instance attribute only because ``_candidates`` is reached
-        #: through the scoring helpers; a stale copy would silently stop
-        #: resolving to events created moments earlier.
         self._active_cache: set[str] | None = None
-        #: Events the ledger already knows about, for identity allocation. Same
-        #: per-burst scoping as ``_active_cache``.
         self._known_events_cache: set[str] | None = None
-
 
     # -- public API -------------------------------------------------------
 
@@ -301,12 +372,7 @@ class EventResolver:
         observation: Observation,
         existing_claims: Sequence[Claim] = (),
     ) -> Resolution:
-        # Idempotency before scoring. Every feed is polled on a timer and re-reads
-        # its whole window each time, so most observations reaching this point are
-        # ones already resolved minutes or hours ago. Deciding that here - rather
-        # than by re-running matching and hoping it lands on the same answer -
-        # is what makes "reprocessing a source cannot fork an event" true by
-        # construction rather than by luck.
+        # 1. Idempotency before scoring.
         already = self.events.event_for_observation(observation.observation_id)
         if already is not None:
             log.debug("observation %s already resolved to %s", observation.observation_id, already)
@@ -317,11 +383,95 @@ class EventResolver:
                 reason="observation already linked to this event (idempotent replay)",
                 candidate_event_id=already,
                 decided_by="idempotent",
+                decision=MatchDecision.MATCH,
+            )
+
+        # 2. Stage 1 Section 6: Deterministic match on (source_id, source_record_id)
+        if observation.source_record_id:
+            exact_event = self.observations.find_event_for_source_record(
+                observation.source_id, observation.source_record_id
+            )
+            if exact_event:
+                self.events.link_observation(exact_event, observation.observation_id)
+                self.events.ensure(exact_event, observation.event_time or utcnow(), self.region_id)
+                self._reactivate(exact_event, observation)
+                if _is_ended_or_resolution(observation):
+                    self.events.set_phase(exact_event, EventPhase.ENDED)
+                    self.events.add_timeline_entry(
+                        TimelineEntry(
+                            event_id=exact_event,
+                            timestamp=observation.observed_at or utcnow(),
+                            event_kind=self.events.kind_of(exact_event),
+                            phase=EventPhase.ENDED,
+                            headline="Condition ended",
+                            detail=f"Source record ended: {observation.headline}",
+                            evidence_observation_ids=(observation.observation_id,),
+                            causal_factor="source_disappearance_or_resolution",
+                        )
+                    )
+                return Resolution(
+                    event_id=exact_event,
+                    is_new_event=False,
+                    score=1.0,
+                    reason=f"deterministic match on source_record_id ({observation.source_record_id})",
+                    candidate_event_id=exact_event,
+                    decided_by="deterministic_id",
+                    decision=MatchDecision.MATCH,
+                )
+
+        # 3. Stage 1 Section 4: Significance Gate
+        if observation.significance_class == SignificanceClass.NOISE:
+            return Resolution(
+                event_id=None,
+                is_new_event=False,
+                score=0.0,
+                reason="significance gate: noise records are not correlated",
+                decided_by="significance_gate",
+                decision=MatchDecision.NEW,
             )
 
         candidates = self._candidates(observation)
 
+        # Deterministic match on shared payload IDs (closure_id, permit_id, cad_event_number)
+        p = observation.structured_payload or {}
+        closure_id = str(p.get("closure_id") or "")
+        permit_id = str(p.get("permit_id") or "")
+        cad_num = str(p.get("cad_event_number") or p.get("incident_id") or "")
+
+        if closure_id or permit_id or cad_num:
+            for cand in candidates:
+                for c_obs in cand.observations:
+                    cp = c_obs.structured_payload or {}
+                    if (
+                        (closure_id and str(cp.get("closure_id") or "") == closure_id)
+                        or (permit_id and str(cp.get("permit_id") or "") == permit_id)
+                        or (cad_num and str(cp.get("cad_event_number") or cp.get("incident_id") or "") == cad_num)
+                    ):
+                        self.events.link_observation(cand.event_id, observation.observation_id)
+                        self.events.ensure(cand.event_id, observation.event_time or utcnow(), self.region_id)
+                        self._reactivate(cand.event_id, observation)
+                        if _is_ended_or_resolution(observation):
+                            self.events.set_phase(cand.event_id, EventPhase.ENDED)
+                        return Resolution(
+                            event_id=cand.event_id,
+                            is_new_event=False,
+                            score=1.0,
+                            reason="deterministic match on shared payload ID",
+                            candidate_event_id=cand.event_id,
+                            decided_by="deterministic_id",
+                            decision=MatchDecision.MATCH,
+                        )
+
         if not candidates:
+            if observation.significance_class == SignificanceClass.STATE_ONLY:
+                return Resolution(
+                    event_id=None,
+                    is_new_event=False,
+                    score=0.0,
+                    reason="significance gate: state_only observations do not create new events",
+                    decided_by="significance_gate",
+                    decision=MatchDecision.NEW,
+                )
             return self._open_event(
                 observation,
                 "no candidate within temporal/geographic constraints",
@@ -331,26 +481,16 @@ class EventResolver:
         scored.sort(key=lambda pair: pair[0].score, reverse=True)
         best_score, best = scored[0]
 
-        if best_score.score < self.merge_threshold or not self._has_corroboration(
-            best_score.evidence
-        ):
-            reason = (
-                f"best candidate {best.event_id} scored {best_score.score:.2f} "
-                f"< threshold {self.merge_threshold:.2f} ({best_score.reason})"
-            )
-            if best_score.score >= self.merge_threshold:
-                reason += "; no corroborating evidence beyond proximity"
-            return self._open_event(
-                observation,
-                reason,
-                candidate_event_id=best.event_id,
-                evidence=best_score.evidence,
-                score=best_score.score,
-            )
+        # Contradictions checking
+        self._record_contradictions_if_any(observation, best, existing_claims)
 
         # Ambiguous band: deterministic evidence is close but not decisive.
         decided_by = "deterministic"
-        if best_score.score < self.merge_threshold + 0.12 and len(candidates) > 1:
+        if (
+            self.possible_threshold <= best_score.score < self.merge_threshold
+            and len(candidates) > 1
+            and not isinstance(self.llm, NullLlmClient)
+        ):
             llm_decision = self.llm.resolve_event(
                 candidate=self._candidate_summary(observation, existing_claims),
                 options=[self._candidate_summary_obs(observation, c) for _, c in scored[:4]],
@@ -362,17 +502,76 @@ class EventResolver:
                 decided_by = "llm_assisted"
                 log.info("llm-assisted resolution to %s", proposed)
 
-        self.events.link_observation(best.event_id, observation.observation_id)
-        self.events.ensure(best.event_id, observation.event_time, self.region_id)
-        self._reactivate(best.event_id, observation)
-        return Resolution(
-            event_id=best.event_id,
-            is_new_event=False,
-            score=best_score.score,
-            reason=best_score.reason,
+        # MATCH: score >= merge_threshold with corroboration
+        if best_score.score >= self.merge_threshold and self._has_corroboration(best_score.evidence):
+            self.events.link_observation(best.event_id, observation.observation_id)
+            self.events.ensure(best.event_id, observation.event_time or utcnow(), self.region_id)
+            self._reactivate(best.event_id, observation)
+            if _is_ended_or_resolution(observation):
+                self.events.set_phase(best.event_id, EventPhase.ENDED)
+            return Resolution(
+                event_id=best.event_id,
+                is_new_event=False,
+                score=best_score.score,
+                reason=best_score.reason,
+                candidate_event_id=best.event_id,
+                evidence=best_score.evidence,
+                decided_by=decided_by,
+                decision=MatchDecision.MATCH,
+            )
+
+        # POSSIBLE: middle score -> queue for review, do not merge
+        if best_score.score >= self.possible_threshold:
+            if self.candidates_repo is not None:
+                self.candidates_repo.append(
+                    CorrelationCandidate(
+                        observation_id=observation.observation_id,
+                        event_id=best.event_id,
+                        score=round(best_score.score, 4),
+                        reasons=(best_score.reason,),
+                        decision=MatchDecision.POSSIBLE,
+                    )
+                )
+            if observation.significance_class == SignificanceClass.STATE_ONLY:
+                return Resolution(
+                    event_id=None,
+                    is_new_event=False,
+                    score=best_score.score,
+                    reason="state_only observation does not open a new event (possible match recorded)",
+                    decided_by=decided_by,
+                    decision=MatchDecision.POSSIBLE,
+                )
+            return self._open_event(
+                observation,
+                f"possible match to {best.event_id} (score {best_score.score:.2f}); opened new event per policy",
+                candidate_event_id=best.event_id,
+                evidence=best_score.evidence,
+                score=best_score.score,
+                decision=MatchDecision.POSSIBLE,
+            )
+
+        # NEW: score < possible_threshold
+        if observation.significance_class == SignificanceClass.STATE_ONLY:
+            return Resolution(
+                event_id=None,
+                is_new_event=False,
+                score=best_score.score,
+                reason="state_only observation does not open a new event",
+                decided_by=decided_by,
+                decision=MatchDecision.NEW,
+            )
+
+        reason = (
+            f"best candidate {best.event_id} scored {best_score.score:.2f} "
+            f"< threshold {self.possible_threshold:.2f} ({best_score.reason})"
+        )
+        return self._open_event(
+            observation,
+            reason,
             candidate_event_id=best.event_id,
             evidence=best_score.evidence,
-            decided_by=decided_by,
+            score=best_score.score,
+            decision=MatchDecision.NEW,
         )
 
     def _open_event(
@@ -383,29 +582,30 @@ class EventResolver:
         candidate_event_id: str | None = None,
         evidence: dict[str, float] | None = None,
         score: float = 1.0,
+        decision: MatchDecision = MatchDecision.NEW,
     ) -> Resolution:
-        """Open a new event with an identity the rest of the system can trust.
-
-        Delegates to the allocator rather than hashing attributes here, so the
-        rule about when two situations may share an id lives in exactly one
-        place.
-        """
-
+        """Open a new event with kind, phase, timeline entry, and persistent identity."""
         allocation = self.identities.allocate(
             observation,
             event_exists=self._event_exists,
             event_for_observation=self.events.event_for_observation,
             observations_of=self.events.observations_of,
         )
-        self.events.ensure(allocation.event_id, observation.event_time, self.region_id)
-        self.events.link_observation(allocation.event_id, observation.observation_id)
         now = utcnow()
-        event_time = ensure_utc(observation.event_time)
-        if event_time > now + timedelta(days=1) or (
-            observation.observation_type == ObservationType.PERMIT_EVENT and event_time > now
-        ):
+        event_time = ensure_utc(observation.event_time) if observation.event_time else now
+
+        kind = infer_event_kind(observation)
+        phase = infer_initial_phase(observation, kind)
+
+        self.events.ensure(allocation.event_id, event_time, self.region_id, kind=kind, phase=phase)
+        self.events.set_kind(allocation.event_id, kind)
+        self.events.set_phase(allocation.event_id, phase)
+        self.events.link_observation(allocation.event_id, observation.observation_id)
+
+        # Status for backward compatibility
+        if phase == EventPhase.SCHEDULED:
             initial_status = "planned"
-        elif (now - event_time).total_seconds() > 7 * 86400:
+        elif phase in (EventPhase.HISTORICAL, EventPhase.ENDED):
             initial_status = "closed"
         elif observation.observation_type in (
             ObservationType.BRIDGE_RESTRICTION,
@@ -424,17 +624,30 @@ class EventResolver:
         self.events.set_status(
             allocation.event_id,
             initial_status,
-            observation.observed_at,
+            observation.observed_at or now,
             f"first report: {allocation.basis}",
+        )
+        self.events.add_timeline_entry(
+            TimelineEntry(
+                event_id=allocation.event_id,
+                timestamp=observation.observed_at or now,
+                event_kind=kind,
+                phase=phase,
+                headline=f"Event opened ({kind.value})",
+                detail=f"{reason} [identity:{allocation.basis}]",
+                evidence_observation_ids=(observation.observation_id,),
+                causal_factor=allocation.basis,
+            )
         )
         if self._known_events_cache is not None:
             self._known_events_cache.add(allocation.event_id)
         log.info(
-            "opened event %s for observation %s (%s, ordinal %d, status=%s)",
+            "opened event %s for observation %s (%s, kind=%s, phase=%s, status=%s)",
             allocation.event_id,
             observation.observation_id,
             allocation.basis,
-            allocation.ordinal,
+            kind.value,
+            phase.value,
             initial_status,
         )
 
@@ -446,7 +659,39 @@ class EventResolver:
             candidate_event_id=candidate_event_id,
             evidence=dict(evidence or {}),
             decided_by="deterministic",
+            decision=decision,
         )
+
+    def _record_contradictions_if_any(
+        self,
+        observation: Observation,
+        candidate: Candidate,
+        existing_claims: Sequence[Claim],
+    ) -> None:
+        if self.contradictions_repo is None or not candidate.claims:
+            return
+        incoming = existing_claims or (self.claim_extractor.extract(observation, "") if self.claim_extractor else ())
+        for inc in incoming:
+            for prior in candidate.claims:
+                if inc.predicate == prior.predicate and _norm(inc.value) != _norm(prior.value):
+                    val_a = _norm(inc.value)
+                    val_b = _norm(prior.value)
+                    conflicting_pairs = {
+                        ("open", "closed"), ("closed", "open"),
+                        ("true", "false"), ("false", "true"),
+                        ("blocked", "clear"), ("clear", "blocked"),
+                    }
+                    if (val_a, val_b) in conflicting_pairs or inc.predicate in ("road.status", "incident.status"):
+                        self.contradictions_repo.append(
+                            Contradiction(
+                                event_id=candidate.event_id,
+                                predicate=inc.predicate,
+                                claim_id_a=inc.claim_id,
+                                claim_id_b=prior.claim_id,
+                                value_a=inc.value,
+                                value_b=prior.value,
+                            )
+                        )
 
     def _reactivate(self, event_id: str, observation: Observation) -> None:
         """Restore an event that was closed or marked quiet to ``active``.
