@@ -105,6 +105,94 @@ CREATE TABLE event_states (
     PRIMARY KEY (event_id, state_version)
 );
 
+-- ``reconstructed_at`` is when the platform formed this belief, which is not
+-- ``created_at``. They differ whenever the ledger is backfilled: a week-old
+-- incident replayed today writes every version today, and section 49's
+-- "what did we believe at time T" is unanswerable from write time alone.
+CREATE INDEX event_states_reconstructed_idx
+    ON event_states (reconstructed_at DESC);
+
+-- Durable state deltas. Kept outside ``analysis_runs`` on purpose: a delta has
+-- to exist the moment its state version does, in the same transaction, or it
+-- does not exist at all for any event no analysis happened to run on. The
+-- (region_id, is_material, recorded_at) index is what makes "what is changing
+-- right now anywhere in this region" a bounded read rather than a table scan.
+CREATE TABLE state_deltas (
+    delta_id               UUID PRIMARY KEY,
+    schema_version         TEXT NOT NULL DEFAULT '1.0.0',
+    event_id               UUID NOT NULL REFERENCES events(event_id),
+    region_id              TEXT NOT NULL DEFAULT '',
+    state_version          INTEGER NOT NULL,
+    previous_state_version INTEGER,
+    change                 TEXT NOT NULL,
+    domain                 TEXT NOT NULL DEFAULT 'event',
+    before                 JSONB,
+    after                  JSONB,
+    magnitude              DOUBLE PRECISION NOT NULL DEFAULT 0,
+    confidence             DOUBLE PRECISION NOT NULL DEFAULT 0,
+    novelty                DOUBLE PRECISION NOT NULL DEFAULT 0,
+    is_material            BOOLEAN NOT NULL DEFAULT FALSE,
+    causes                 JSONB NOT NULL DEFAULT '[]'::jsonb,
+    urgency                TEXT NOT NULL DEFAULT 'none',
+    affected_user_count    INTEGER NOT NULL DEFAULT 0,
+    official_guidance      BOOLEAN NOT NULL DEFAULT FALSE,
+    recorded_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The delta is a fact about one version of one event. The unique constraint
+    -- is what makes re-deriving a state version idempotent instead of
+    -- duplicating every change it explains.
+    UNIQUE (event_id, state_version, change)
+);
+
+CREATE INDEX state_deltas_event_idx
+    ON state_deltas (event_id, state_version);
+CREATE INDEX state_deltas_region_material_idx
+    ON state_deltas (region_id, is_material, recorded_at DESC)
+    WHERE is_material;
+
+-- Lifecycle transitions: what status an event moved to, when, and on what
+-- evidence. Closure inferred from silence and closure announced by an official
+-- record are different facts with very different confidence, and only a log
+-- records which one happened.
+CREATE TABLE event_lifecycle (
+    transition_id            UUID PRIMARY KEY,
+    event_id                 UUID NOT NULL REFERENCES events(event_id),
+    region_id                TEXT NOT NULL DEFAULT '',
+    from_status              TEXT,
+    to_status                TEXT NOT NULL,
+    reason                   TEXT NOT NULL DEFAULT '',
+    termination_basis        TEXT NOT NULL DEFAULT 'unknown',
+    confidence               DOUBLE PRECISION NOT NULL DEFAULT 0,
+    evidence_observation_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    silence_threshold_seconds DOUBLE PRECISION,
+    observation_count        INTEGER NOT NULL DEFAULT 0,
+    state_version            INTEGER,
+    at                       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX lifecycle_event_idx ON event_lifecycle (event_id, at DESC);
+CREATE INDEX lifecycle_basis_idx ON event_lifecycle (termination_basis, at DESC);
+
+-- The cross-event world view. A projection, not a source of truth: every field
+-- is derived from state versions that already exist, and ``observation_total``
+-- is recorded so a stale snapshot is recognisable as stale rather than
+-- authoritative.
+CREATE TABLE world_snapshots (
+    snapshot_id               UUID PRIMARY KEY,
+    schema_version            TEXT NOT NULL DEFAULT '1.0.0',
+    region_id                 TEXT NOT NULL,
+    generated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    observation_total         INTEGER NOT NULL DEFAULT 0,
+    events_total              INTEGER NOT NULL DEFAULT 0,
+    events_active             INTEGER NOT NULL DEFAULT 0,
+    events_quiescent          INTEGER NOT NULL DEFAULT 0,
+    events_closed             INTEGER NOT NULL DEFAULT 0,
+    events_changed_materially INTEGER NOT NULL DEFAULT 0,
+    snapshot                  JSONB NOT NULL
+);
+
+CREATE INDEX world_snapshots_region_idx
+    ON world_snapshots (region_id, generated_at DESC);
+
 CREATE TABLE claims (
     claim_id              UUID PRIMARY KEY,
     observation_id        UUID NOT NULL REFERENCES observations(observation_id),

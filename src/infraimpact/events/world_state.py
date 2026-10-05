@@ -35,6 +35,8 @@ from ..domain.schemas import (
     Observation,
 )
 from ..storage.repository import StateRepository
+from .lifecycle import LifecycleEngine
+from .scale import ScaleEstimator
 
 log = logging.getLogger(__name__)
 
@@ -68,10 +70,26 @@ _SEVERITY_ORDER = {
 
 
 class WorldStateEngine:
-    """Rebuilds ``EventState`` from observations + claims."""
+    """Rebuilds ``EventState`` from observations + claims.
 
-    def __init__(self, states: StateRepository) -> None:
+    Scale and lifecycle are delegated rather than reimplemented here. They are
+    the two parts of reconstruction that have to answer "how big is this, and is
+    it still happening" for *any* event type, and both are too large and too
+    subtle to keep inline - a hardcoded hour threshold and a substring search
+    for "dispers" are what this replaced. Keeping them in their own modules also
+    keeps them independently testable, which inline logic is not.
+    """
+
+    def __init__(
+        self,
+        states: StateRepository,
+        *,
+        scale: ScaleEstimator | None = None,
+        lifecycle: LifecycleEngine | None = None,
+    ) -> None:
         self.states = states
+        self.scale = scale or ScaleEstimator()
+        self.lifecycle = lifecycle or LifecycleEngine()
 
     def rebuild(
         self,
@@ -84,7 +102,7 @@ class WorldStateEngine:
         """Reconstruct the state for one event.
 
         Pure and deterministic: same observations plus same previous state gives
-        the same result, with no clock outside ``now`` and no network. That is
+        the result, with no clock outside ``now`` and no network. That is
         section 33's replayability guarantee, and it is why no language model is
         consulted anywhere in this module - the section-18 narrative lives on the
         :class:`~infraimpact.domain.schemas.AnalysisRun` instead.
@@ -100,15 +118,26 @@ class WorldStateEngine:
         movement = self._movement(ordered, previous)
         affected = self._affected_infrastructure(ordered)
         evidence = self._evidence(ordered, claims, affected, now)
-        status = self._status(ordered, now)
         distribution = self._type_distribution(ordered)
+        scale = self.scale.estimate(ordered, now=now, claims=claims)
+        lifecycle = self.lifecycle.assess(
+            event_id,
+            ordered,
+            now=now,
+            had_impacts=bool(affected),
+            unresolved_impacts=tuple(i.identifier for i in affected),
+            previous=previous.lifecycle if previous else None,
+        )
         derived = self._derived(geometry, ordered, movement, affected, evidence)
 
         return EventState(
             event_id=event_id,
             state_version=(previous.state_version + 1) if previous else 1,
             event_type_distribution=distribution,
-            status=status,
+            # Lifecycle owns status. It is the same value it publishes to
+            # ``event_lifecycle``, which is what stops the status in a state
+            # version and the status in the lifecycle log from disagreeing.
+            status=lifecycle.status,
             geometry=geometry,
             geometry_confidence=geometry_confidence,
             first_observed=first,
@@ -117,6 +146,8 @@ class WorldStateEngine:
             movement=movement,
             affected_infrastructure=tuple(affected),
             evidence=evidence,
+            scale=scale,
+            lifecycle=lifecycle,
             observation_ids=tuple(o.observation_id for o in ordered),
             claim_ids=tuple(c.claim_id for c in claims),
             derived=derived,
@@ -312,23 +343,6 @@ class WorldStateEngine:
             freshness_seconds=freshness,
             vector=vector,
         )
-
-    def _status(self, observations: Sequence[Observation], now) -> str:
-        if not observations:
-            return "candidate"
-        latest = max(o.observed_at for o in observations)
-        idle = (now - latest).total_seconds()
-        has_dispersal = any(
-            "dispers" in (o.headline or "").lower()
-            or "dispers" in str(o.structured_payload).lower()
-            or "reopen" in str(o.structured_payload).lower()
-            for o in observations
-        )
-        if idle > 3600 and has_dispersal:
-            return "closed"
-        if idle > 3600:
-            return "quiescent"
-        return "active"
 
     def _type_distribution(self, observations: Sequence[Observation]) -> dict[str, float]:
         """Soft classification over event types, not a single hard label."""

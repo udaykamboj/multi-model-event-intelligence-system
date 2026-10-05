@@ -38,6 +38,7 @@ from .enums import (
     Urgency,
 )
 from .geo import Geometry
+from .ids import new_id
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -257,6 +258,123 @@ class AffectedInfrastructure(BaseModel):
     detected_at: datetime | None = None
 
 
+# --------------------------------------------------------------------------
+# Magnitude, rate, duration (world-state scale)
+# --------------------------------------------------------------------------
+
+
+class QuantityEstimate(BaseModel):
+    """One measured magnitude, carrying its own uncertainty.
+
+    A bare number is the thing this exists to prevent. "300" is not a
+    measurement; "300, somewhere between 150 and 600, asserted by two
+    independent sources that disagree by a factor of two" is. The three numbers
+    travel together or not at all:
+
+    ``value``/``lower``/``upper``  the estimate and the interval it falls in
+    ``disagreement``               0..1 spread between sources, so "two sources
+                                   agree" and "two sources contradict" are
+                                   distinguishable from "one source said 300"
+    ``confidence``                 how much weight downstream may place on it
+
+    Sources are *not* averaged into a false consensus (section 11). When two
+    sources disagree the disagreement is widened into the interval and reported,
+    rather than silently collapsed to a midpoint.
+    """
+
+    quantity: str
+    unit: str | None = None
+    value: float | None = None
+    lower: float | None = None
+    upper: float | None = None
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    method: Literal["source_structured", "aggregate", "derived", "claim"] = "source_structured"
+    observation_ids: tuple[str, ...] = ()
+    source_count: int = 1
+    disagreement: float = Field(0.0, ge=0.0, le=1.0)
+    #: True when no source in the ledger asserts this quantity for this event.
+    #: The platform reports an unknown magnitude as absent rather than as zero.
+    unavailable: bool = False
+
+
+class EventRate(BaseModel):
+    """How fast information about this event is arriving.
+
+    Rate is the cheapest available proxy for whether a situation is developing,
+    and it needs no event-type knowledge: a protest, a fire and an earthquake all
+    produce a rising observation rate while they escalate and a falling one as
+    they end.
+    """
+
+    observation_rate_per_hour: float = 0.0
+    recent_rate_per_hour: float = 0.0
+    trend: Literal["rising", "falling", "steady", "unknown"] = "unknown"
+    trend_strength: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class EventDuration(BaseModel):
+    elapsed_seconds: float = 0.0
+    active_span_seconds: float = 0.0
+    since_first_observed: datetime | None = None
+    last_observation_at: datetime | None = None
+    #: How long the platform has seen nothing. The lifecycle engine reads this
+    #: rather than a hardcoded interval, because "how long is quiet" is
+    #: different for a 4-minute traffic stop and a 3-day wildfire.
+    silence_seconds: float = 0.0
+
+
+class EventScale(BaseModel):
+    """How big, how fast, how long. Absent when the data does not permit it.
+
+    Every field here is nullable in spirit and default-empty in fact. An event
+    whose sources report no magnitude gets ``magnitudes=()`` and
+    ``primary=None`` - it does not get ``value=0.0``, which would assert an
+    absence of magnitude rather than an absence of measurement.
+    """
+
+    magnitudes: tuple[QuantityEstimate, ...] = ()
+    primary: QuantityEstimate | None = None
+    rate: EventRate = Field(default_factory=EventRate)
+    duration: EventDuration = Field(default_factory=EventDuration)
+
+
+class LifecycleAssessment(BaseModel):
+    """Why an event is in the state it is in.
+
+    Termination is the hardest thing to get right in a world-state system,
+    because closing an event that is still happening is worse than leaving a
+    finished one open: the first silently deletes live information from every
+    downstream view. So the verdict is stored with its basis and its evidence,
+    and never as a bare string.
+
+    ``termination_basis`` is what makes it auditable:
+
+    ``official_release``   an official record says it is over
+    ``resolution_record``  a reopening/restoration record retired the disruption
+    ``silence``            no new information for longer than this event's own
+                           reporting cadence implies is normal
+    ``observation_cease``  the reporting window itself ended
+    ``unknown``            nothing to conclude yet
+    """
+
+    status: Literal["candidate", "active", "quiescent", "closed"] = "candidate"
+    reason: str = ""
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    termination_basis: Literal[
+        "official_release",
+        "resolution_record",
+        "silence",
+        "observation_cease",
+        "unknown",
+    ] = "unknown"
+    evidence_observation_ids: tuple[str, ...] = ()
+    quiet_since: datetime | None = None
+    assessed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    #: The silence threshold this verdict used, so a later reader can tell
+    #: whether a different threshold would have given a different answer.
+    silence_threshold_seconds: float | None = None
+
+
 class EventState(BaseModel):
     """A point-in-time reconstruction. Never overwritten - a new version is written."""
 
@@ -280,6 +398,13 @@ class EventState(BaseModel):
 
     affected_infrastructure: tuple[AffectedInfrastructure, ...] = ()
     evidence: EvidenceSummary = Field(default_factory=EvidenceSummary)
+
+    #: How big, how fast, how long. Additive per section 65 - an event with no
+    #: measurable scale carries empty defaults, never zeroes implying a
+    #: measurement of "nothing".
+    scale: EventScale = Field(default_factory=EventScale)
+    #: Why this event is active/quiescent/closed, with its evidence.
+    lifecycle: LifecycleAssessment = Field(default_factory=LifecycleAssessment)
 
     observation_ids: tuple[str, ...] = ()
     claim_ids: tuple[str, ...] = ()
@@ -351,9 +476,87 @@ class StateDelta(BaseModel):
     affected_user_count: int = 0
 
 
+class StateDeltaRecord(BaseModel):
+    """A delta as a durable, independently queryable row.
+
+    ``StateDelta`` above is a value object: it lives inside an ``AnalysisRun``,
+    which means it is only reachable by parsing that run's JSON blob, and it
+    disappears entirely if the run is never written. That is wrong for the
+    world's central question - *what changed?* - because the answer must exist
+    the moment the state it describes exists, independent of whether any
+    analysis subsequently ran on it.
+
+    So a delta is written in the same transaction as the state version it
+    describes, and carries the provenance that makes it trustworthy on its own:
+    which observations caused it, which state version it came from, and whether
+    it cleared the materiality floor.
+    """
+
+    delta_id: str
+    schema_version: str = SCHEMA_VERSION
+
+    event_id: str
+    region_id: str = ""
+    state_version: int
+    previous_state_version: int | None = None
+
+    change: str
+    domain: str = "event"
+    before: Any = None
+    after: Any = None
+    magnitude: float = Field(0.0, ge=0.0, le=1.0)
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    novelty: float = Field(0.0, ge=0.0, le=1.0)
+    is_material: bool = False
+
+    causes: tuple[str, ...] = ()
+    urgency: Urgency = Urgency.NONE
+    affected_user_count: int = 0
+    official_guidance: bool = False
+
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @classmethod
+    def from_delta(
+        cls,
+        delta: StateDelta,
+        *,
+        event_id: str,
+        state_version: int,
+        previous_state_version: int | None,
+        region_id: str = "",
+        is_material: bool = False,
+        recorded_at: datetime | None = None,
+    ) -> "StateDeltaRecord":
+        from .ids import deterministic_id
+
+        stamp = recorded_at or datetime.now(UTC)
+        return cls(
+            delta_id=deterministic_id(
+                "dlt", event_id, state_version, delta.change, delta.domain
+            ),
+            event_id=event_id,
+            region_id=region_id,
+            state_version=state_version,
+            previous_state_version=previous_state_version,
+            change=delta.change,
+            domain=delta.domain,
+            before=delta.before,
+            after=delta.after,
+            magnitude=delta.magnitude,
+            confidence=delta.confidence,
+            novelty=delta.novelty,
+            is_material=is_material,
+            causes=delta.causes,
+            urgency=delta.urgency,
+            affected_user_count=delta.affected_user_count,
+            official_guidance=delta.official_guidance,
+            recorded_at=stamp,
+        )
+
+
 class AnalysisRun(BaseModel):
     """Section 43: makes every production decision replayable."""
-
     model_config = ConfigDict(frozen=True)
 
     analysis_run_id: str
@@ -551,3 +754,171 @@ class SourceHealth(BaseModel):
     usage: Literal["realtime", "historical_only", "context_only"] = "realtime"
     message: str | None = None
     capability_tier: CapabilityTier = CapabilityTier.TRIGGERED
+
+
+# --------------------------------------------------------------------------
+# World state (cross-event projection)
+# --------------------------------------------------------------------------
+
+
+class EventLifecycleTransition(BaseModel):
+    """One recorded change of an event's lifecycle state.
+
+    ``EventState.status`` is a *conclusion*; this is the *history* of how the
+    platform reached it. Without the history, a status column that has been
+    overwritten in place cannot answer the only question that matters after the
+    fact: why did the system believe this was over, and on what evidence. That
+    question has to be answerable while the event is still active too, because
+    deciding to close an event is the decision most worth being able to audit.
+    """
+
+    #: Self-assigned. It was a required argument, and the runtime constructed
+    #: this record without one - which raised a ValidationError inside the
+    #: per-event transaction, so the state version, the deltas and the
+    #: lifecycle row were all rolled back together. The loop swallowed the
+    #: exception per event, ran to completion, and reported a clean cycle while
+    #: persisting no state at all. An identity field that a caller can forget
+    #: should not be one; durable records generate their own.
+    transition_id: str = Field(default_factory=lambda: new_id("lct"))
+    event_id: str
+    region_id: str = ""
+
+    from_status: str | None = None
+    to_status: str
+    reason: str = ""
+    termination_basis: str = "unknown"
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    evidence_observation_ids: tuple[str, ...] = ()
+    silence_threshold_seconds: float | None = None
+    observation_count: int = 0
+    state_version: int | None = None
+
+    at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @classmethod
+    def from_assessment(
+        cls,
+        assessment: LifecycleAssessment,
+        *,
+        event_id: str,
+        previous_status: str | None,
+        region_id: str = "",
+        observation_count: int = 0,
+        state_version: int | None = None,
+    ) -> "EventLifecycleTransition":
+        from .ids import deterministic_id
+
+        return cls(
+            transition_id=deterministic_id(
+                "lcy", event_id, previous_status or "-", assessment.status, assessment.assessed_at.isoformat()
+            ),
+            event_id=event_id,
+            region_id=region_id,
+            from_status=previous_status,
+            to_status=assessment.status,
+            reason=assessment.reason,
+            termination_basis=assessment.termination_basis,
+            confidence=assessment.confidence,
+            evidence_observation_ids=assessment.evidence_observation_ids,
+            silence_threshold_seconds=assessment.silence_threshold_seconds,
+            observation_count=observation_count,
+            state_version=state_version,
+            at=assessment.assessed_at,
+        )
+
+
+class WorldEventEntry(BaseModel):
+    """One event's contribution to "what is happening right now".
+
+    Deliberately not a full ``EventState``. A world view has to be cheap enough
+    to rebuild on every cycle and small enough to serve whole, so it carries the
+    fields that answer "is this happening, where, how bad, and did it just
+    change" and nothing else. The full reconstruction is one lookup away on
+    ``/v1/events/{id}``.
+    """
+
+    event_id: str
+    status: str = "candidate"
+    state_version: int = 1
+
+    dominant_type: str | None = None
+    type_distribution: dict[str, float] = Field(default_factory=dict)
+
+    first_observed: datetime | None = None
+    last_observed: datetime | None = None
+    centroid: tuple[float, float] | None = None
+    footprint_area_m2: float = 0.0
+
+    moving: bool = False
+    movement_speed: float | None = None
+    movement_direction_deg: float | None = None
+
+    affected_domains: tuple[str, ...] = ()
+    impact_count: int = 0
+    severity_peak: Urgency = Urgency.NONE
+
+    evidence_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    independent_source_count: int = 0
+
+    primary_magnitude: QuantityEstimate | None = None
+    duration_seconds: float = 0.0
+    observation_rate_per_hour: float = 0.0
+    rate_trend: str = "unknown"
+
+    #: Did this event's state change materially on the last rebuild? This is
+    #: what separates "500 things are open" from "10 of them just moved", which
+    #: is the distinction section 33 says should drive how much work happens.
+    changed_materially: bool = False
+    last_change: str | None = None
+    lifecycle_reason: str | None = None
+
+
+class WorldSnapshot(BaseModel):
+    """The platform's answer to "what is happening in the world right now?".
+
+    Assembled from every event's latest state plus source health. It is a
+    projection, not a source of truth: it can always be rebuilt from the ledger,
+    and it records the observation count and generation time it was built from
+    so a stale snapshot is recognisable as stale rather than silently served as
+    current.
+    """
+
+    snapshot_id: str
+    schema_version: str = SCHEMA_VERSION
+    region_id: str
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    observation_total: int = 0
+    events_total: int = 0
+    events_active: int = 0
+    events_quiescent: int = 0
+    events_closed: int = 0
+    events_changed_materially: int = 0
+
+    events: tuple[WorldEventEntry, ...] = ()
+
+    #: domain -> number of events currently affecting it.
+    domain_activity: dict[str, int] = Field(default_factory=dict)
+    #: source_id -> health state value.
+    source_health: dict[str, str] = Field(default_factory=dict)
+    sources_degraded: tuple[str, ...] = ()
+    #: Signals the catalogue knows cannot be observed right now. Carried into
+    #: the world view on purpose: a world picture that silently omits traffic
+    #: because the feed is unreachable reads exactly like a world with no
+    #: traffic problems.
+    coverage_gaps: tuple[str, ...] = ()
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "region_id": self.region_id,
+            "generated_at": self.generated_at.isoformat(),
+            "observation_total": self.observation_total,
+            "events_total": self.events_total,
+            "events_active": self.events_active,
+            "events_quiescent": self.events_quiescent,
+            "events_closed": self.events_closed,
+            "events_changed_materially": self.events_changed_materially,
+            "domain_activity": dict(self.domain_activity),
+            "sources_degraded": list(self.sources_degraded),
+            "coverage_gaps": list(self.coverage_gaps),
+        }

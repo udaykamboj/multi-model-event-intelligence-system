@@ -24,25 +24,31 @@ from ..domain.ids import ensure_utc
 from ..domain.schemas import (
     AnalysisRun,
     Claim,
+    EventLifecycleTransition,
     EventState,
     NotificationCandidate,
     Observation,
     RouteProfile,
     SavedPlace,
     SourceHealth,
+    StateDeltaRecord,
     UserContext,
+    WorldSnapshot,
 )
 from .repository import (
     AnalysisRunRepository,
     ClaimRepository,
+    EventLifecycleRepository,
     EventRepository,
     NotificationRepository,
     ObservationRepository,
     PlatformRepository,
     SourceHealthRepository,
+    StateDeltaRepository,
     StateRepository,
     UserImpactRepository,
     UserRepository,
+    WorldSnapshotRepository,
 )
 
 SCHEMA = """
@@ -132,6 +138,79 @@ CREATE TABLE IF NOT EXISTS event_states (
     created_at       TEXT NOT NULL,
     PRIMARY KEY (event_id, state_version)
 );
+
+-- Section 32/54: "what changed?" is first-class, so it gets its own table rather
+-- than living only inside an opaque analysis_runs JSON blob. The world-state
+-- engine writes these in the same transaction as the state version they describe,
+-- which is what makes the delta survive independently of whether any analysis
+-- subsequently ran. before/after hold arbitrary JSON because a delta is a
+-- comparison of whatever the previous state believed against whatever the new
+-- one does, and that differs per change kind.
+CREATE TABLE IF NOT EXISTS state_deltas (
+    delta_id                 TEXT PRIMARY KEY,
+    schema_version           TEXT NOT NULL DEFAULT '1.0.0',
+    event_id                 TEXT NOT NULL,
+    region_id                TEXT NOT NULL DEFAULT '',
+    state_version            INTEGER NOT NULL,
+    previous_state_version   INTEGER,
+    change                   TEXT NOT NULL,
+    domain                   TEXT NOT NULL DEFAULT 'event',
+    before                   TEXT,
+    after                    TEXT,
+    magnitude                REAL NOT NULL DEFAULT 0,
+    confidence               REAL NOT NULL DEFAULT 0,
+    novelty                  REAL NOT NULL DEFAULT 0,
+    is_material              INTEGER NOT NULL DEFAULT 0,
+    causes                   TEXT NOT NULL DEFAULT '[]',
+    urgency                  TEXT NOT NULL DEFAULT 'none',
+    affected_user_count      INTEGER NOT NULL DEFAULT 0,
+    official_guidance        INTEGER NOT NULL DEFAULT 0,
+    recorded_at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deltas_event ON state_deltas(event_id, state_version);
+-- The region-wide change feed: material changes newest-first, filterable by event.
+CREATE INDEX IF NOT EXISTS idx_deltas_material ON state_deltas(is_material, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deltas_region ON state_deltas(region_id, recorded_at DESC);
+
+-- Lifecycle history. The events.status column holds the current conclusion and is
+-- overwritten in place; this holds how the platform reached it and on what
+-- evidence, which is the part that has to survive for an audit of a closure.
+CREATE TABLE IF NOT EXISTS event_lifecycle (
+    transition_id             TEXT PRIMARY KEY,
+    event_id                  TEXT NOT NULL,
+    region_id                 TEXT NOT NULL DEFAULT '',
+    from_status               TEXT,
+    to_status                 TEXT NOT NULL,
+    reason                    TEXT NOT NULL DEFAULT '',
+    termination_basis         TEXT NOT NULL DEFAULT 'unknown',
+    confidence                REAL NOT NULL DEFAULT 0,
+    evidence_observation_ids  TEXT NOT NULL DEFAULT '[]',
+    silence_threshold_seconds REAL,
+    observation_count         INTEGER NOT NULL DEFAULT 0,
+    state_version             INTEGER,
+    at                        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_event ON event_lifecycle(event_id, at DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_region ON event_lifecycle(region_id, at DESC);
+
+-- Cross-event world projection: the platform's current answer to "what is
+-- happening right now". A projection, not a source of truth - it can always be
+-- rebuilt from event_states, and observation_total records what it was built
+-- from so a stale snapshot is recognisable as stale rather than served as current.
+CREATE TABLE IF NOT EXISTS world_snapshots (
+    snapshot_id               TEXT PRIMARY KEY,
+    schema_version            TEXT NOT NULL DEFAULT '1.0.0',
+    region_id                 TEXT NOT NULL,
+    generated_at              TEXT NOT NULL,
+    observation_total         INTEGER NOT NULL DEFAULT 0,
+    events_total              INTEGER NOT NULL DEFAULT 0,
+    events_active             INTEGER NOT NULL DEFAULT 0,
+    events_quiescent          INTEGER NOT NULL DEFAULT 0,
+    events_closed             INTEGER NOT NULL DEFAULT 0,
+    events_changed_materially INTEGER NOT NULL DEFAULT 0,
+    snapshot                  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_world_region ON world_snapshots(region_id, generated_at DESC);
 
 CREATE TABLE IF NOT EXISTS claims (
     claim_id              TEXT PRIMARY KEY,
@@ -260,6 +339,86 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str)
     existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _delta_from_row(row: dict[str, Any]) -> StateDeltaRecord:
+    """Rebuild a delta record from its row.
+
+    ``before``/``after`` are stored as JSON text because a delta compares
+    whatever two state versions happened to believe, and that shape differs per
+    change kind - a geometry change carries a centroid and an area, a severity
+    change carries two enum values, an impact-appeared change carries a list of
+    identifiers. One JSON column each beats a fixed schema that fits none of
+    them, and the reconstruction is lossless because the values went in as JSON.
+    """
+
+    row = dict(row)
+    return StateDeltaRecord(
+        delta_id=row["delta_id"],
+        schema_version=row.get("schema_version") or "1.0.0",
+        event_id=row["event_id"],
+        region_id=row.get("region_id") or "",
+        state_version=int(row["state_version"]),
+        previous_state_version=(
+            int(row["previous_state_version"])
+            if row.get("previous_state_version") is not None
+            else None
+        ),
+        change=row["change"],
+        domain=row.get("domain") or "event",
+        before=_json_or_none(row.get("before")),
+        after=_json_or_none(row.get("after")),
+        magnitude=float(row.get("magnitude") or 0.0),
+        confidence=float(row.get("confidence") or 0.0),
+        novelty=float(row.get("novelty") or 0.0),
+        is_material=bool(row.get("is_material")),
+        causes=tuple(json.loads(row.get("causes") or "[]")),
+        urgency=row.get("urgency") or "none",
+        affected_user_count=int(row.get("affected_user_count") or 0),
+        official_guidance=bool(row.get("official_guidance")),
+        recorded_at=ensure_utc(
+            datetime.fromisoformat(row["recorded_at"])
+            if not isinstance(row["recorded_at"], datetime)
+            else row["recorded_at"]
+        ),
+    )
+
+
+def _json_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        text = value.decode() if isinstance(value, bytes) else value
+        if not text or text == "null":
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return value
+
+
+def _transition_from_row(row: dict[str, Any]) -> EventLifecycleTransition:
+    row = dict(row)
+    at = row["at"]
+    return EventLifecycleTransition(
+        transition_id=row["transition_id"],
+        event_id=row["event_id"],
+        region_id=row.get("region_id") or "",
+        from_status=row.get("from_status"),
+        to_status=row["to_status"],
+        reason=row.get("reason") or "",
+        termination_basis=row.get("termination_basis") or "unknown",
+        confidence=float(row.get("confidence") or 0.0),
+        evidence_observation_ids=tuple(json.loads(row.get("evidence_observation_ids") or "[]")),
+        silence_threshold_seconds=row.get("silence_threshold_seconds"),
+        observation_count=int(row.get("observation_count") or 0),
+        state_version=(
+            int(row["state_version"]) if row.get("state_version") is not None else None
+        ),
+        at=at if isinstance(at, datetime) else datetime.fromisoformat(at),
+    )
+
 
 
 class _Transaction:
@@ -431,6 +590,22 @@ class SqliteEventRepository(_SqliteRepo, EventRepository):
         )
         return [r["observation_id"] for r in rows]
 
+    def event_for_observation(self, observation_id: str) -> str | None:
+        """Reverse index lookup on ``event_observations``.
+
+        Cheap because ``idx_eo_obs`` exists for exactly this. It is the check
+        that makes ingestion idempotent for events rather than merely
+        deduplicated for observations: an observation that is already attached
+        can never be attached a second time, so re-polling a feed cannot split
+        one real-world event across two ids.
+        """
+
+        rows = self._query(
+            "SELECT event_id FROM event_observations WHERE observation_id=? ORDER BY linked_at ASC LIMIT 1",
+            (observation_id,),
+        )
+        return rows[0]["event_id"] if rows else None
+
     def active_events(self) -> list[str]:
         rows = self._query("SELECT event_id FROM events WHERE status != 'closed'")
         return [r["event_id"] for r in rows]
@@ -441,6 +616,44 @@ class SqliteEventRepository(_SqliteRepo, EventRepository):
                FROM events e ORDER BY e.updated_at DESC"""
         )
         return [dict(r) for r in rows]
+
+    def status_of(self, event_id: str) -> str | None:
+        rows = self._query("SELECT status FROM events WHERE event_id=?", (event_id,))
+        return rows[0]["status"] if rows else None
+
+    def set_status(self, event_id: str, status: str, at: datetime, reason: str) -> bool:
+        """Record a lifecycle status.
+
+        Status moves in both directions, so this writes ``status`` rather than
+        only ever stamping ``closed_at``. Reactivating matters: an event that has
+        gone quiet and then produces a new report is the same event, still
+        happening, and a system that can only close would have to either keep it
+        closed (silencing a live situation) or invent a new id (forking its
+        history).
+
+        ``closed_at``/``close_reason`` are cleared on reactivation so a reopened
+        event does not carry a stale end timestamp. Returns False when the event
+        row does not exist, which is the caller's signal to create it.
+        """
+
+        cursor = self._execute(
+            """UPDATE events
+               SET status=?,
+                   updated_at=?,
+                   closed_at=CASE WHEN ?='closed' THEN ? ELSE NULL END,
+                   close_reason=CASE WHEN ?='closed' THEN ? ELSE NULL END
+               WHERE event_id=?""",
+            (
+                status,
+                ensure_utc(at).isoformat(),
+                status,
+                ensure_utc(at).isoformat(),
+                status,
+                reason[:500],
+                event_id,
+            ),
+        )
+        return bool(cursor.rowcount)
 
     def close(self, event_id: str, at: datetime, reason: str) -> None:
         self._execute(
@@ -524,6 +737,214 @@ class SqliteStateRepository(_SqliteRepo, StateRepository):
             (event_id, ensure_utc(as_of).isoformat()),
         )
         return EventState.model_validate_json(rows[0]["state"]) if rows else None
+
+    def latest_all(self, limit: int = 1000) -> list[EventState]:
+        """Latest state per event in one read.
+
+        A correlated subquery per event would work and would be a query per
+        event anyway, so this uses a window function and reads the table once.
+        The world projection runs on every cycle over every event, which makes
+        the difference between O(1) and O(events) queries per cycle.
+        """
+
+        rows = self._query(
+            """SELECT state FROM (
+                   SELECT state, state_version, reconstructed_at,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY event_id ORDER BY state_version DESC
+                          ) AS rn
+                   FROM event_states
+               ) WHERE rn = 1
+               ORDER BY reconstructed_at DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        return [EventState.model_validate_json(r["state"]) for r in rows]
+
+
+class SqliteStateDeltaRepository(_SqliteRepo, StateDeltaRepository):
+    """Durable state deltas.
+
+    This is the table that makes "what changed?" a first-class, queryable fact
+    rather than a field buried in an analysis run's JSON. Two consequences matter:
+
+    - A delta exists the moment its state version exists, in the same
+      transaction, so it cannot be lost because no analysis ran.
+    - It can be asked about without parsing run blobs: "what has materially
+      changed about this event in the last hour" and "what is changing anywhere
+      in this region right now" are both single indexed reads.
+    """
+
+    def append_many(self, records: Sequence[StateDeltaRecord]) -> int:
+        if not records:
+            return 0
+        written = 0
+        for record in records:
+            cursor = self._execute(
+                """INSERT INTO state_deltas (
+                       delta_id, schema_version, event_id, region_id,
+                       state_version, previous_state_version, change, domain,
+                       before, after, magnitude, confidence, novelty,
+                       is_material, causes, urgency, affected_user_count,
+                       official_guidance, recorded_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(delta_id) DO NOTHING""",
+                (
+                    record.delta_id,
+                    record.schema_version,
+                    record.event_id,
+                    record.region_id,
+                    record.state_version,
+                    record.previous_state_version,
+                    record.change,
+                    record.domain,
+                    json.dumps(record.before, default=str),
+                    json.dumps(record.after, default=str),
+                    record.magnitude,
+                    record.confidence,
+                    record.novelty,
+                    1 if record.is_material else 0,
+                    json.dumps(list(record.causes)),
+                    str(record.urgency),
+                    record.affected_user_count,
+                    1 if record.official_guidance else 0,
+                    ensure_utc(record.recorded_at).isoformat(),
+                ),
+            )
+            # rowcount is 0 on conflict, so re-rebuilding an identical state
+            # version reports 0 new deltas rather than double-counting them.
+            written += max(0, cursor.rowcount)
+        return written
+
+    def for_event(self, event_id: str, limit: int = 200) -> list[StateDeltaRecord]:
+        rows = self._query(
+            """SELECT * FROM state_deltas WHERE event_id=?
+               ORDER BY state_version ASC, magnitude DESC LIMIT ?""",
+            (event_id, limit),
+        )
+        return [_delta_from_row(r) for r in rows]
+
+    def for_state_version(self, event_id: str, state_version: int) -> list[StateDeltaRecord]:
+        rows = self._query(
+            """SELECT * FROM state_deltas WHERE event_id=? AND state_version=?
+               ORDER BY magnitude DESC""",
+            (event_id, state_version),
+        )
+        return [_delta_from_row(r) for r in rows]
+
+    def material_since(self, event_id: str, since: datetime) -> list[StateDeltaRecord]:
+        rows = self._query(
+            """SELECT * FROM state_deltas
+               WHERE event_id=? AND is_material=1 AND recorded_at >= ?
+               ORDER BY recorded_at ASC, magnitude DESC""",
+            (event_id, ensure_utc(since).isoformat()),
+        )
+        return [_delta_from_row(r) for r in rows]
+
+    def recent(self, region_id: str | None = None, limit: int = 200) -> list[StateDeltaRecord]:
+        if region_id:
+            rows = self._query(
+                """SELECT * FROM state_deltas
+                   WHERE is_material=1 AND region_id=?
+                   ORDER BY recorded_at DESC, magnitude DESC LIMIT ?""",
+                (region_id, limit),
+            )
+        else:
+            rows = self._query(
+                """SELECT * FROM state_deltas WHERE is_material=1
+                   ORDER BY recorded_at DESC, magnitude DESC LIMIT ?""",
+                (limit,),
+            )
+        return [_delta_from_row(r) for r in rows]
+
+    def count(self) -> int:
+        rows = self._query("SELECT COUNT(*) AS n FROM state_deltas")
+        return int(rows[0]["n"]) if rows else 0
+
+
+class SqliteEventLifecycleRepository(_SqliteRepo, EventLifecycleRepository):
+    def record(self, transition: EventLifecycleTransition) -> None:
+        self._execute(
+            """INSERT INTO event_lifecycle (
+                   transition_id, event_id, region_id, from_status, to_status,
+                   reason, termination_basis, confidence,
+                   evidence_observation_ids, silence_threshold_seconds,
+                   observation_count, state_version, at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(transition_id) DO NOTHING""",
+            (
+                transition.transition_id,
+                transition.event_id,
+                transition.region_id,
+                transition.from_status,
+                transition.to_status,
+                transition.reason,
+                transition.termination_basis,
+                transition.confidence,
+                json.dumps(list(transition.evidence_observation_ids)),
+                transition.silence_threshold_seconds,
+                transition.observation_count,
+                transition.state_version,
+                ensure_utc(transition.at).isoformat(),
+            ),
+        )
+
+    def for_event(self, event_id: str) -> list[EventLifecycleTransition]:
+        rows = self._query(
+            "SELECT * FROM event_lifecycle WHERE event_id=? ORDER BY at ASC", (event_id,)
+        )
+        return [_transition_from_row(r) for r in rows]
+
+    def latest(self, event_id: str) -> EventLifecycleTransition | None:
+        rows = self._query(
+            "SELECT * FROM event_lifecycle WHERE event_id=? ORDER BY at DESC LIMIT 1",
+            (event_id,),
+        )
+        return _transition_from_row(rows[0]) if rows else None
+
+
+class SqliteWorldSnapshotRepository(_SqliteRepo, WorldSnapshotRepository):
+    def put(self, snapshot: WorldSnapshot) -> None:
+        self._execute(
+            """INSERT INTO world_snapshots (
+                   snapshot_id, schema_version, region_id, generated_at,
+                   observation_total, events_total, events_active,
+                   events_quiescent, events_closed, events_changed_materially,
+                   snapshot
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(snapshot_id) DO UPDATE SET
+                   snapshot=excluded.snapshot,
+                   generated_at=excluded.generated_at""",
+            (
+                snapshot.snapshot_id,
+                snapshot.schema_version,
+                snapshot.region_id,
+                ensure_utc(snapshot.generated_at).isoformat(),
+                snapshot.observation_total,
+                snapshot.events_total,
+                snapshot.events_active,
+                snapshot.events_quiescent,
+                snapshot.events_closed,
+                snapshot.events_changed_materially,
+                _dump(snapshot),
+            ),
+        )
+
+    def latest(self, region_id: str) -> WorldSnapshot | None:
+        rows = self._query(
+            """SELECT snapshot FROM world_snapshots WHERE region_id=?
+               ORDER BY generated_at DESC LIMIT 1""",
+            (region_id,),
+        )
+        return WorldSnapshot.model_validate_json(rows[0]["snapshot"]) if rows else None
+
+    def history(self, region_id: str, limit: int = 50) -> list[WorldSnapshot]:
+        rows = self._query(
+            """SELECT snapshot FROM world_snapshots WHERE region_id=?
+               ORDER BY generated_at DESC LIMIT ?""",
+            (region_id, limit),
+        )
+        return [WorldSnapshot.model_validate_json(r["snapshot"]) for r in rows]
 
 
 class SqliteClaimRepository(_SqliteRepo, ClaimRepository):
@@ -823,6 +1244,9 @@ class SqlitePlatformRepository(PlatformRepository):
         self.observations = SqliteObservationRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.events = SqliteEventRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.states = SqliteStateRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.deltas = SqliteStateDeltaRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.lifecycle = SqliteEventLifecycleRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
+        self.world = SqliteWorldSnapshotRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.claims = SqliteClaimRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.runs = SqliteAnalysisRunRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]
         self.users = SqliteUserRepository(self._conn, self._lock, self._tx)  # type: ignore[arg-type]

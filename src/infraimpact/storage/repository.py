@@ -16,13 +16,16 @@ from typing import Any, Iterable, Sequence
 from ..domain.schemas import (
     AnalysisRun,
     Claim,
+    EventLifecycleTransition,
     EventState,
     NotificationCandidate,
     Observation,
     RouteProfile,
     SavedPlace,
     SourceHealth,
+    StateDeltaRecord,
     UserContext,
+    WorldSnapshot,
 )
 
 
@@ -84,6 +87,19 @@ class EventRepository(ABC):
     def link_observation(self, event_id: str, observation_id: str) -> None: ...
 
     @abstractmethod
+    def event_for_observation(self, observation_id: str) -> str | None:
+        """The event this observation belongs to, if any.
+
+        This is the reverse of ``link_observation`` and it enforces the invariant
+        the whole world-state system rests on: *an observation belongs to at
+        most one event, permanently*. Resolution consults it before doing any
+        scoring, so reprocessing a source - which is routine, because every feed
+        is polled on a timer and re-reads its whole window each time - can never
+        fork an event's history into two ids that then reconstruct two different
+        fictions from the same evidence.
+        """
+
+    @abstractmethod
     def observations_of(self, event_id: str) -> list[str]: ...
 
     @abstractmethod
@@ -91,6 +107,20 @@ class EventRepository(ABC):
 
     @abstractmethod
     def all_events(self) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    def status_of(self, event_id: str) -> str | None:
+        """Persisted lifecycle status, or ``None`` if the event is unknown."""
+
+    @abstractmethod
+    def set_status(self, event_id: str, status: str, at: datetime, reason: str) -> bool:
+        """Record a lifecycle status. Returns False if the row is unknown.
+
+        Separate from :meth:`close` because status moves in both directions - an
+        event that has gone quiet becomes active again the moment something is
+        reported about it, and a system that can only ever close events cannot
+        express that.
+        """
 
     @abstractmethod
     def close(self, event_id: str, at: datetime, reason: str) -> None: ...
@@ -102,6 +132,63 @@ class EventRepository(ABC):
     def merge(self, source_event_id: str, target_event_id: str, reason: str) -> None: ...
 
 
+class EventLifecycleRepository(ABC):
+    @abstractmethod
+    def record(self, transition: EventLifecycleTransition) -> None:
+        """Append one lifecycle transition. History is never overwritten."""
+
+    @abstractmethod
+    def for_event(self, event_id: str) -> list[EventLifecycleTransition]: ...
+
+    @abstractmethod
+    def latest(self, event_id: str) -> EventLifecycleTransition | None: ...
+
+
+class StateDeltaRepository(ABC):
+    @abstractmethod
+    def append_many(self, records: Sequence[StateDeltaRecord]) -> int:
+        """Write a state version's deltas. Idempotent on ``delta_id``."""
+
+    @abstractmethod
+    def for_event(self, event_id: str, limit: int = 200) -> list[StateDeltaRecord]: ...
+
+    @abstractmethod
+    def for_state_version(
+        self, event_id: str, state_version: int
+    ) -> list[StateDeltaRecord]: ...
+
+    @abstractmethod
+    def material_since(
+        self, event_id: str, since: datetime
+    ) -> list[StateDeltaRecord]:
+        """Material changes for one event since a moment.
+
+        Backs "what has materially changed about this event", which is the query
+        a notification, a stream consumer or a user view all need and which was
+        previously only answerable by parsing every analysis run.
+        """
+
+    @abstractmethod
+    def recent(
+        self, region_id: str | None = None, limit: int = 200
+    ) -> list[StateDeltaRecord]:
+        """Material changes across all events - the region's change feed."""
+
+    @abstractmethod
+    def count(self) -> int: ...
+
+
+class WorldSnapshotRepository(ABC):
+    @abstractmethod
+    def put(self, snapshot: WorldSnapshot) -> None: ...
+
+    @abstractmethod
+    def latest(self, region_id: str) -> WorldSnapshot | None: ...
+
+    @abstractmethod
+    def history(self, region_id: str, limit: int = 50) -> list[WorldSnapshot]: ...
+
+
 class StateRepository(ABC):
     @abstractmethod
     def append_state(self, state: EventState) -> None:
@@ -109,6 +196,16 @@ class StateRepository(ABC):
 
     @abstractmethod
     def latest(self, event_id: str) -> EventState | None: ...
+
+    @abstractmethod
+    def latest_all(self, limit: int = 1000) -> list[EventState]:
+        """Latest state for every event, in one read.
+
+        The world projection needs this for every event on every cycle. Fetching
+        them individually is one query per event per cycle, which is the
+        difference between a world view that is cheap to maintain and one that
+        is not.
+        """
 
     @abstractmethod
     def version(self, event_id: str, state_version: int) -> EventState | None: ...
@@ -214,6 +311,9 @@ class PlatformRepository(ABC):
     observations: ObservationRepository
     events: EventRepository
     states: StateRepository
+    deltas: StateDeltaRepository
+    lifecycle: EventLifecycleRepository
+    world: WorldSnapshotRepository
     claims: ClaimRepository
     runs: AnalysisRunRepository
     users: UserRepository

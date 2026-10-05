@@ -22,11 +22,16 @@ from datetime import timedelta
 from typing import Any, Sequence
 
 from ..domain.enums import InfrastructureDomain, ObservationType
-from ..domain.geo import distance_m, haversine_m
+from ..domain.geo import bbox_polygon, centroid_of, distance_m, haversine_m, union_bbox
 from ..domain.ids import deterministic_id, new_id, utcnow
-from ..domain.schemas import Claim, EventState, Observation
+from ..domain.schemas import Claim, EventState, MovementState, Observation
 from ..llm.client import LlmClient, NullLlmClient
-from ..storage.repository import EventRepository, ObservationRepository
+from ..storage.repository import (
+    EventLifecycleRepository,
+    EventRepository,
+    ObservationRepository,
+)
+from .identity import EventIdentityAllocator
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +69,17 @@ TYPE_AFFINITY: dict[ObservationType, float] = {
     ObservationType.POWER_OUTAGE: 0.2,
 }
 
+#: How many closed events are examined, newest first, when deciding which are
+#: eligible to be reopened. Bounds the work of recovery without gating on age,
+#: which is the mistake: an age-based horizon longer than the candidate time
+#: window makes reopening unreachable rather than merely rare.
+_RECOVERY_CLOSED_LIMIT = 500
+
+#: Closure bases that count as statements about the world rather than inferences
+#: from its silence. Events closed on these grounds are not reopened by a late
+#: report.
+_DEFINITIVE_CLOSURES = frozenset({"official_release", "resolution_record"})
+
 _STOPWORDS = frozenset(
     {
         "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "is",
@@ -99,10 +115,79 @@ class Resolution:
 
 @dataclass
 class Candidate:
+    """A possible event for an observation to join.
+
+    ``state`` is optional because it usually is not there yet. The runtime
+    resolves and extracts claims for every observation the moment it is ingested,
+    and only reconstructs state versions afterwards, so during a burst - exactly
+    the situation where matching matters most - the events an observation could
+    join have linked observations but no reconstructed state.
+
+    Skipping those candidates made the resolver's scoring inert in the one
+    scenario it exists for: every observation in a batch found nothing to match
+    and opened its own event. So everything the scorer needs is derived from the
+    linked observations when the state version is absent, using the same
+    conventions :class:`~infraimpact.events.world_state.WorldStateEngine` uses,
+    and the resolver cannot reach a different conclusion about an event than the
+    state engine reaches a moment later.
+    """
+
     event_id: str
-    state: EventState
+    state: EventState | None
     observations: list[Observation]
     claims: list[Claim]
+
+    def __post_init__(self) -> None:
+        self._geometry: dict[str, Any] | None = (
+            self.state.geometry if self.state is not None else self._hull()
+        )
+        self._types: set[str] = set(
+            self.state.evidence.observation_types
+            if self.state is not None
+            else (o.observation_type.value for o in self.observations)
+        )
+        self._first_observed: Any = (
+            self.state.first_observed
+            if self.state is not None
+            else (min((o.event_time for o in self.observations), default=None))
+        )
+
+    @property
+    def geometry(self) -> dict[str, Any] | None:
+        """Where the event is, from the state version if one exists.
+
+        Falls back to the hull of the observations already linked to the event,
+        because during a burst there usually is no state version yet - see
+        :class:`Candidate`'s docstring.
+        """
+
+        return self._geometry
+
+    @property
+    def observation_types(self) -> set[str]:
+        return self._types
+
+    @property
+    def first_observed(self) -> Any:
+        return self._first_observed
+
+    def _hull(self) -> dict[str, Any] | None:
+        """Bounding footprint of the linked observations.
+
+        Deliberately the same upper-bound convention as
+        ``WorldStateEngine._footprint`` - a union bbox, not a claimed shape - so
+        that a candidate with no reconstructed state and a candidate with one
+        describe the same area, and a measurement can never depend on which of
+        the two happened to be available.
+        """
+
+        geometries = [o.geometry for o in self.observations if o.geometry]
+        if not geometries:
+            return None
+        bbox = union_bbox(geometries)
+        if bbox is None:
+            return geometries[0]
+        return bbox_polygon(bbox)
 
 
 class EventResolver:
@@ -114,12 +199,17 @@ class EventResolver:
         states,
         region_id: str,
         *,
+        lifecycle: EventLifecycleRepository | None = None,
         time_window_min: float = 180.0,
         search_radius_m: float = 2500.0,
         merge_threshold: float = 0.62,
         llm: LlmClient | None = None,
     ) -> None:
         self.events = events
+        #: Only consulted for closed events, so this may be None in callers that
+        #: never close anything - an absent lifecycle log means "closed for no
+        #: stated reason", which is recoverable.
+        self.lifecycle = lifecycle
         self.observations = observations
         self.claims_repo = claims
         self.states = states
@@ -128,12 +218,19 @@ class EventResolver:
         self.search_radius_m = search_radius_m
         self.merge_threshold = merge_threshold
         self.llm = llm or NullLlmClient()
+        #: Allocates event identity. See
+        #: :class:`~infraimpact.events.identity.EventIdentityAllocator` for why
+        #: the id cannot be a hash of region/type/day.
+        self.identities = EventIdentityAllocator(region_id)
         #: Scoped to a single :meth:`resolve` call and cleared on the way out,
         #: so it can never go stale across a burst of observations that opens new
         #: events. An instance attribute only because ``_candidates`` is reached
         #: through the scoring helpers; a stale copy would silently stop
         #: resolving to events created moments earlier.
         self._active_cache: set[str] | None = None
+        #: Events the ledger already knows about, for identity allocation. Same
+        #: per-burst scoping as ``_active_cache``.
+        self._known_events_cache: set[str] | None = None
 
     # -- public API -------------------------------------------------------
 
@@ -143,48 +240,63 @@ class EventResolver:
         existing_claims: Sequence[Claim] = (),
     ) -> Resolution:
         self._active_cache = None
+        self._known_events_cache = None
         try:
             return self._resolve(observation, existing_claims)
         finally:
             self._active_cache = None
+            self._known_events_cache = None
 
     def _resolve(
         self,
         observation: Observation,
         existing_claims: Sequence[Claim] = (),
     ) -> Resolution:
+        # Idempotency before scoring. Every feed is polled on a timer and re-reads
+        # its whole window each time, so most observations reaching this point are
+        # ones already resolved minutes or hours ago. Deciding that here - rather
+        # than by re-running matching and hoping it lands on the same answer -
+        # is what makes "reprocessing a source cannot fork an event" true by
+        # construction rather than by luck.
+        already = self.events.event_for_observation(observation.observation_id)
+        if already is not None:
+            log.debug("observation %s already resolved to %s", observation.observation_id, already)
+            return Resolution(
+                event_id=already,
+                is_new_event=False,
+                score=1.0,
+                reason="observation already linked to this event (idempotent replay)",
+                candidate_event_id=already,
+                decided_by="idempotent",
+            )
+
         candidates = self._candidates(observation)
 
         if not candidates:
-            event_id = self._new_event_id(observation)
-            self.events.ensure(event_id, observation.event_time, self.region_id)
-            self.events.link_observation(event_id, observation.observation_id)
-            return Resolution(
-                event_id=event_id,
-                is_new_event=True,
-                score=1.0,
-                reason="no candidate within temporal/geographic constraints",
-                decided_by="deterministic",
+            return self._open_event(
+                observation,
+                "no candidate within temporal/geographic constraints",
             )
 
         scored = [(self.score(observation, c, existing_claims), c) for c in candidates]
         scored.sort(key=lambda pair: pair[0].score, reverse=True)
         best_score, best = scored[0]
 
-        if best_score.score < self.merge_threshold:
-            event_id = self._new_event_id(observation)
-            self.events.ensure(event_id, observation.event_time, self.region_id)
-            self.events.link_observation(event_id, observation.observation_id)
-            return Resolution(
-                event_id=event_id,
-                is_new_event=True,
-                score=best_score.score,
-                reason=(
-                    f"best candidate {best.event_id} scored {best_score.score:.2f} "
-                    f"< threshold {self.merge_threshold:.2f} ({best_score.reason})"
-                ),
+        if best_score.score < self.merge_threshold or not self._has_corroboration(
+            best_score.evidence
+        ):
+            reason = (
+                f"best candidate {best.event_id} scored {best_score.score:.2f} "
+                f"< threshold {self.merge_threshold:.2f} ({best_score.reason})"
+            )
+            if best_score.score >= self.merge_threshold:
+                reason += "; no corroborating evidence beyond proximity"
+            return self._open_event(
+                observation,
+                reason,
                 candidate_event_id=best.event_id,
                 evidence=best_score.evidence,
+                score=best_score.score,
             )
 
         # Ambiguous band: deterministic evidence is close but not decisive.
@@ -203,6 +315,7 @@ class EventResolver:
 
         self.events.link_observation(best.event_id, observation.observation_id)
         self.events.ensure(best.event_id, observation.event_time, self.region_id)
+        self._reactivate(best.event_id, observation)
         return Resolution(
             event_id=best.event_id,
             is_new_event=False,
@@ -212,6 +325,102 @@ class EventResolver:
             evidence=best_score.evidence,
             decided_by=decided_by,
         )
+
+    def _open_event(
+        self,
+        observation: Observation,
+        reason: str,
+        *,
+        candidate_event_id: str | None = None,
+        evidence: dict[str, float] | None = None,
+        score: float = 1.0,
+    ) -> Resolution:
+        """Open a new event with an identity the rest of the system can trust.
+
+        Delegates to the allocator rather than hashing attributes here, so the
+        rule about when two situations may share an id lives in exactly one
+        place.
+        """
+
+        allocation = self.identities.allocate(
+            observation,
+            event_exists=self._event_exists,
+            event_for_observation=self.events.event_for_observation,
+            observations_of=self.events.observations_of,
+        )
+        self.events.ensure(allocation.event_id, observation.event_time, self.region_id)
+        self.events.link_observation(allocation.event_id, observation.observation_id)
+        self.events.set_status(
+            allocation.event_id,
+            "active",
+            observation.observed_at,
+            f"first report: {allocation.basis}",
+        )
+        if self._known_events_cache is not None:
+            self._known_events_cache.add(allocation.event_id)
+        log.info(
+            "opened event %s for observation %s (%s, ordinal %d)",
+            allocation.event_id,
+            observation.observation_id,
+            allocation.basis,
+            allocation.ordinal,
+        )
+        return Resolution(
+            event_id=allocation.event_id,
+            is_new_event=True,
+            score=score,
+            reason=f"{reason} [identity:{allocation.basis}]",
+            candidate_event_id=candidate_event_id,
+            evidence=dict(evidence or {}),
+            decided_by="deterministic",
+        )
+
+    def _reactivate(self, event_id: str, observation: Observation) -> None:
+        """Restore an event that was closed or marked quiet to ``active``.
+
+        Silence is not closure. An event that has been quiet long enough to be
+        marked quiescent is still the event it was, and when it produces a new
+        report that is news about a known situation - not grounds for inventing
+        a second, identical-looking one. Reactivation is also what stops a
+        long-running event from accumulating fragments: without it, every
+        reappearance after a gap becomes a new id, and the platform ends up
+        reconstructing five short lives instead of one long one.
+
+        The prior status is preserved in the resolution reason and in the
+        lifecycle table, so the quiet period stays visible in the history rather
+        than being erased.
+        """
+
+        status = self.events.status_of(event_id)
+        if status is None or status == "active":
+            return
+        self.events.set_status(
+            event_id,
+            "active",
+            observation.observed_at,
+            f"new report after {status}",
+        )
+        log.info("reactivated %s from %s", event_id, status)
+
+    def _event_exists(self, event_id: str) -> bool:
+        """Does the ledger already hold this id?
+
+        Cached per resolution burst. Every event opened during the burst has to
+        be visible to the next observation's allocation, otherwise a batch of
+        observations sharing a fingerprint would each be handed ordinal 1.
+        """
+
+        if self._known_events_cache is None:
+            self._known_events_cache = {row["event_id"] for row in self.events.all_events()}
+        if event_id in self._known_events_cache:
+            return True
+        # ``all_events`` snapshots rows created before this burst; a
+        # mid-burst allocation consults ``set_status``/``ensure`` afterwards, so
+        # the cache has to be extended in step.
+        if self.events.status_of(event_id) is not None:
+            self._known_events_cache.add(event_id)
+            return True
+        return False
 
     def merge_events(self, source_event_id: str, target_event_id: str, reason: str) -> None:
         """Section 10: reversible merge with recorded history."""
@@ -235,34 +444,90 @@ class EventResolver:
 
         out: list[Candidate] = []
         for event_id in self.observations.event_ids_between(window_start, window_end):
-            if event_id not in self._active_now():
-                continue
-            state = self._latest_state(event_id)
-            if state is None:
+            if event_id not in self._reachable():
                 continue
             obs = self.observations.list_for_event(event_id)
             if not obs:
                 continue
             if not self._temporally_compatible(observation, obs):
                 continue
-            if observation.geometry and state.geometry:
-                if distance_m(observation.geometry, state.geometry) > self.search_radius_m:
+            candidate = Candidate(
+                event_id,
+                self._latest_state(event_id),
+                obs,
+                self.claims_repo.claims_for_event(event_id),
+            )
+            # The binding constraint. A road closure in Ballard and one on
+            # Aurora are both "road closure, this hour", so time and type
+            # similarity will happily rate them alike; distance is what
+            # distinguishes them. Testing it before scoring is what turns the
+            # final weighted sum from a rubber stamp into a decision - without
+            # this, spatial proximity was only ever 30% of a score that needed
+            # 62% to pass.
+            if observation.geometry and candidate.geometry:
+                if distance_m(observation.geometry, candidate.geometry) > self.search_radius_m:
                     continue
-            out.append(Candidate(event_id, state, obs, self.claims_repo.claims_for_event(event_id)))
+            out.append(candidate)
         return out
 
-    def _active_now(self) -> set[str]:
-        """Active event ids, refreshed at most once per resolution burst.
+    def _reachable(self) -> set[str]:
+        """Events that could receive a new observation.
 
-        ``active_events()`` is itself a query, and the set only changes when an
-        event is opened or closed, so caching it for the duration of one
-        resolve call is safe and removes the last full-table read from the hot
-        path.
+        ``active_events()`` is a query and the set only changes when an event is
+        opened or closed, so caching it for the duration of one resolve call is
+        safe and removes the last full-table read from the hot path.
+
+        Closed events are included on purpose. Closure means "we are no longer
+        expecting reports", not "no report may ever arrive again" - a bridge fire
+        is closed and then reopens because someone calls it in. If closed events
+        were excluded outright, each reappearance would be forced into a fresh
+        id, and a single long-running situation would be reconstructed as a
+        series of unrelated short ones with no way to tell them apart after the
+        fact. The cost is bounded by the ``closed`` status filter below, which
+        keeps events closed recently out of the hot path and lets genuinely stale
+        ones back in as the gap grows.
         """
 
         if self._active_cache is None:
             self._active_cache = set(self.events.active_events())
+            self._active_cache |= self._recoverable()
         return self._active_cache
+
+    def _recoverable(self) -> set[str]:
+        """Closed events that a new report is allowed to reopen.
+
+        Closure is not final, but not every closure deserves to be undone either,
+        so the two are separated by *why* the event was closed rather than by how
+        long ago.
+
+        An event closed because an official record said it had ended, or because
+        its last disruption was formally retired, stays closed. Those are
+        statements about the world, not inferences from its silence, and a late
+        duplicate report should not resurrect one.
+
+        An event closed because nothing was heard for a while is recoverable.
+        That closure was a guess, and a guess that turns out to be wrong should
+        be corrected rather than compounded: the new report belongs to the
+        situation already on file, and opening a second id for it would split
+        one real event into two fictional ones.
+
+        Note this is not gated on how long ago the event closed. An earlier
+        version used a fixed horizon, which made reopening unreachable in
+        practice: the horizon was longer than the candidate time window, so by
+        the time an event was old enough to be eligible, its observations had
+        already fallen out of the window that finds candidates at all. Bounded
+        instead by how many closed events are examined, most recent first.
+        """
+
+        rows = self.events.all_events()
+        closed = [r for r in rows if r.get("status") == "closed"][:_RECOVERY_CLOSED_LIMIT]
+        out: set[str] = set()
+        for row in closed:
+            event_id = str(row["event_id"])
+            latest = self.lifecycle.latest(event_id) if self.lifecycle else None
+            if latest is None or latest.termination_basis not in _DEFINITIVE_CLOSURES:
+                out.add(event_id)
+        return out
 
     def _temporally_compatible(self, observation: Observation, siblings: Sequence[Observation]) -> bool:
         if not siblings:
@@ -330,11 +595,11 @@ class EventResolver:
         )
 
     def _spatial(self, observation: Observation, candidate: Candidate) -> float:
-        if not observation.geometry or not candidate.state.geometry:
+        if not observation.geometry or not candidate.geometry:
             # An official record without geometry should not be discarded; treat
             # missing geometry as weak-neutral rather than disqualifying.
             return 0.4 if observation.provenance.authority.value == "official" else 0.15
-        d = distance_m(observation.geometry, candidate.state.geometry)
+        d = distance_m(observation.geometry, candidate.geometry)
         if d == 0:
             return 1.0
         # Full credit inside 250 m, decaying to 0 at the search radius.
@@ -348,14 +613,48 @@ class EventResolver:
         return max(0.0, 1.0 - (nearest / (self.time_window_min * 60)))
 
     def _type_compatibility(self, observation: Observation, candidate: Candidate) -> float:
+        """How well does this observation's type fit what the event is made of?
+
+        Note what this does *not* encode: any relation between two different
+        incident types. ``TYPE_AFFINITY`` says how strongly a type implies that
+        an event exists at all, not whether an earthquake and a road closure are
+        related, so it cannot answer "is this the same kind of thing". Every
+        value in it is positive, which means two simultaneous incidents of
+        different types always look somewhat compatible here. That gap is real
+        and is closed structurally by :meth:`_has_corroboration` rather than by
+        inventing a pairwise table that would have to be maintained per domain.
+        """
+
         obs_type = observation.observation_type
         affinity = TYPE_AFFINITY.get(obs_type, 0.2)
-        state_types = set(candidate.state.evidence.observation_types)
+        state_types = candidate.observation_types
         if obs_type.value in state_types:
             return min(1.0, affinity + 0.4)
         # Related-but-different types (a closure alongside a gathering) still
         # support association, just weakly.
         return affinity
+
+    def _has_corroboration(self, evidence: dict[str, float]) -> bool:
+        """Is there positive evidence that two records describe one situation?
+
+        Spatial and temporal proximity alone are not identity. Two separate
+        things routinely happen at the same place at the same time - that is
+        what a city is - so a pair scoring well on proximity and nothing else is
+        far more likely to be two events than one. Requiring a second,
+        independent signal (shared entities, or a claim the candidate already
+        asserts) is what stops proximity from quietly doing the deciding on its
+        own.
+
+        The two signals are named rather than thresholded because "enough" is
+        not a number here: entity overlap is a lexical measure that reports 0.0
+        for a perfectly real match with different wording, while claim
+        continuity is a structured assertion that reports 0.0 for a real match
+        that happens to say something new.
+        """
+
+        return evidence.get("entity_overlap", 0.0) > 0.0 or evidence.get(
+            "claim_continuity", 0.0
+        ) > 0.3
 
     def _entity_overlap(
         self, observation: Observation, candidate: Candidate, existing_claims: Sequence[Claim]
@@ -401,14 +700,17 @@ class EventResolver:
         A new location slightly offset in the direction the event was already
         moving is compatible; a location in the opposite direction is weaker.
         """
-        if not observation.geometry or not candidate.state.geometry:
+        if not observation.geometry or not candidate.geometry:
             return 0.4
-        movement = candidate.state.movement
+        movement = (
+            candidate.state.movement
+            if candidate.state is not None
+            else self._movement_of(candidate.observations)
+        )
         if not movement.moving or movement.direction_deg is None:
             return 0.5
-        from ..domain.geo import centroid_of
 
-        a = centroid_of(candidate.state.geometry)
+        a = centroid_of(candidate.geometry)
         b = centroid_of(observation.geometry)
         if a is None or b is None:
             return 0.4
@@ -420,13 +722,47 @@ class EventResolver:
         alignment = max(0.0, 1.0 - delta / 180.0)
         return round(0.35 + 0.55 * alignment, 4)
 
+    @staticmethod
+    def _movement_of(observations: Sequence[Observation]) -> MovementState:
+        """Direction of travel from the linked observations.
+
+        Needed because during a burst there is no reconstructed state to read
+        movement from. Derived the same way ``WorldStateEngine._movement`` does
+        it, for the same reason: the resolver must not reach a different
+        conclusion about an event than the state engine will a moment later.
+        """
+
+        points = [
+            (o.event_time, centroid_of(o.geometry))
+            for o in observations
+            if o.geometry and centroid_of(o.geometry)
+        ]
+        if len(points) < 2:
+            return MovementState(moving=False)
+        points.sort(key=lambda pair: pair[0])
+        span = (points[-1][0] - points[0][0]).total_seconds()
+        if span <= 0:
+            return MovementState(moving=False)
+        return MovementState(moving=True, direction_deg=_bearing(points[0][1], points[-1][1]))
+
     # -- helpers ----------------------------------------------------------
 
     def _latest_state(self, event_id: str) -> EventState | None:
         return self.states.latest(event_id)
 
     def _new_event_id(self, observation: Observation) -> str:
-        """Deterministic-per-day id keeps replay reproducible."""
+        """Deprecated. Identity now lives in :class:`EventIdentityAllocator`.
+
+        Kept only because tests reached for it directly. It is the bug: an id
+        derived from region + type + calendar day is shared by every unrelated
+        event sharing those three attributes, which is not a rare edge case but
+        the normal case for any region with more than one thing happening in it.
+        """
+
+        log.warning(
+            "_new_event_id is deprecated and reproduces the identity collision "
+            "bug; use _open_event so identity is allocated properly"
+        )
         day = observation.event_time.strftime("%Y%m%d")
         return deterministic_id("evt", self.region_id, observation.observation_type, day)[:24]
 
@@ -441,11 +777,15 @@ class EventResolver:
         return {
             "event_id": candidate.event_id,
             "observation_type": str(observation.observation_type),
-            "state_type_distribution": candidate.state.event_type_distribution,
+            "state_type_distribution": (
+                candidate.state.event_type_distribution
+                if candidate.state is not None
+                else dict.fromkeys(sorted(candidate.observation_types), 1.0 / max(1, len(candidate.observations)))
+            ),
             "predicates": sorted({c.predicate for c in candidate.claims}),
-            "first_observed": candidate.state.first_observed.isoformat()
-            if candidate.state.first_observed
-            else None,
+            "first_observed": (
+                candidate.first_observed.isoformat() if candidate.first_observed else None
+            ),
         }
 
 

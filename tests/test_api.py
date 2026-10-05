@@ -343,15 +343,43 @@ class TestInternalRoutes:
         assert "models" in reg_resp
         assert reg_resp["total"] >= 5
         models = reg_resp["models"]
-        first_model = models[0]["model_id"]
 
-        # Promote to challenger
-        promote_resp = app_client.post(
+        # The default registry is untrained, so promotion is refused - with a
+        # reason, not a 404 that looks like a typo.
+        untrained = models[0]["model_id"]
+        resp = app_client.post(
             "/internal/models/promote",
-            json={"model_id": first_model, "target_mode": "challenger"},
-        ).json()
-        assert promote_resp["promoted"] is True
-        assert promote_resp["new_deployment_mode"] == "challenger"
+            json={"model_id": untrained, "target_mode": "challenger"},
+        )
+        assert resp.status_code == 409
+        assert "no trained weights" in resp.json()["detail"]
+
+        # An unknown model is still a 404, so the two failures stay distinct.
+        assert (
+            app_client.post(
+                "/internal/models/promote",
+                json={"model_id": "no-such-model", "target_mode": "champion"},
+            ).status_code
+            == 404
+        )
+
+    def test_trained_baseline_model_promotes(self, app_client):
+        """Promotion works once real weights are behind it."""
+        from infraimpact.models.portfolio import BaselineEventClassifier
+        from infraimpact.models.base import ModelDeploymentMode
+
+        reg = app_client.app.state.runtime.orchestrator.model_registry
+        reg.register(BaselineEventClassifier())
+
+        resp = app_client.post(
+            "/internal/models/promote",
+            json={"model_id": "event-classifier-v1.0.0", "target_mode": "challenger"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["promoted"] is True
+        assert resp.json()["new_deployment_mode"] == "challenger"
+
+        assert reg.get("event-classifier-v1.0.0").deployment_mode == ModelDeploymentMode.CHALLENGER
 
     def test_internal_training_dataset_extraction(self, app_client):
         resp = app_client.post("/internal/training/dataset", json={"event_id": "evt_1"})
@@ -478,3 +506,53 @@ class TestStream:
     def test_dead_letter_is_not_a_client_topic(self):
         assert "dead_letter" not in STREAM_TOPICS
         assert str(Topic.DEAD_LETTER) not in STREAM_TOPICS
+
+class TestWorldView:
+    """The question the platform exists to answer, over HTTP."""
+
+    def test_world_view_lists_open_events(self, app_client):
+        body = app_client.get("/v1/world").json()
+
+        assert body["region_id"] == "puget-sound"
+        assert body["events_total"] == 1
+        assert body["observation_total"] == 1
+        assert body["events"][0]["event_id"] == "evt_1"
+        # Tracked and changed are different numbers, and both are reported.
+        assert body["events_changed_materially"] == 0
+        assert "generated_at" in body
+        assert "coverage_gaps" in body
+
+    def test_world_view_reports_coverage_gaps_rather_than_assurance(self, app_client, repo):
+        from infraimpact.domain.enums import HealthState
+        from infraimpact.domain.schemas import SourceHealth
+
+        repo.source_health.put(
+            SourceHealth(
+                source_id="sdot.feed",
+                state=HealthState.DEGRADED,
+                usage="realtime",
+            )
+        )
+        body = app_client.get("/v1/world", params={"refresh": True}).json()
+
+        assert body["sources_degraded"] == ["sdot.feed"]
+        assert "sdot.feed:degraded" in body["coverage_gaps"]
+
+    def test_refresh_rebuilds_from_stored_states(self, app_client, repo):
+        before = repo.world.latest("puget-sound")
+        assert before is None
+
+        body = app_client.get("/v1/world", params={"refresh": True}).json()
+
+        assert body["events_total"] == 1
+        # The refreshed snapshot is persisted, so the next plain GET is a read.
+        assert repo.world.latest("puget-sound") is not None
+
+    def test_a_region_with_no_events_is_empty_not_an_error(self, repo, bus):
+        settings = Settings(database_url="sqlite:///unused.db", region_id="puget-sound")
+        with TestClient(create_app(settings, repo, bus, run_loop=False)) as client:
+            body = client.get("/v1/world").json()
+
+        assert body["events_total"] == 0
+        assert body["events"] == []
+        assert body["observation_total"] == 0

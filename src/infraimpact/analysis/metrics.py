@@ -72,6 +72,78 @@ _DETERMINISTIC_BY_CAPABILITY = {
 # --------------------------------------------------------------------------
 
 
+def _is_placeholder_output(output: dict[str, Any]) -> bool:
+    """Did this model actually run, or is it reporting that it has no weights?
+
+    The flag on the output row is authoritative. The status string is checked as
+    a fallback, and case-insensitively, because it is a free-form value inside a
+    payload and the enum has been spelled both ``model_required`` and
+    ``MODEL_REQUIRED`` in different places. Comparing one spelling exactly meant
+    an untrained model whose output said ``MODEL_REQUIRED`` was reported as
+    ``COMPLETED`` with a confidence of 0.8 - the metrics claiming a successful
+    prediction from a model that produced no prediction at all.
+
+    Normalising here rather than in each caller means the honesty of a model's
+    claim is decided once.
+    """
+
+    if output.get("is_placeholder"):
+        return True
+    status = output.get("status")
+    return isinstance(status, str) and status.strip().lower() == "model_required"
+
+
+def _reported_confidence(output: ModelOutput) -> float | None:
+    """The model's own confidence, or nothing at all.
+
+    Uncertainty gives it: ``1 - uncertainty``. When a model reports neither,
+    the answer is ``None``, not 0.8. The previous default of 0.8 was an
+    invented number attached to a prediction nobody had scored, and it was
+    attached most often to exactly the predictions that should have carried no
+    confidence at all. An absent confidence is a legible gap; a made-up one
+    reads as a measurement.
+    """
+
+    if output.uncertainty is not None:
+        return round(1.0 - output.uncertainty, 4)
+    if output.probability is not None:
+        return round(output.probability, 4)
+    return None
+
+
+def _explanation_of(output: ModelOutput) -> str:
+    """Why the model answered the way it did, in words a reader can act on.
+
+    Models explain themselves in ``notes``; ``explanation`` is a legacy key some
+    payloads use instead. Only the former was read, so every model record in the
+    analysis came back with an empty explanation - including the ones that most
+    needed one, the models reporting they could not answer. A record that says
+    MODEL_REQUIRED without saying why is a dead end for whoever has to go and
+    train it.
+    """
+
+    notes = output.output.get("notes")
+    legacy = output.output.get("explanation")
+    status = output.output.get("status")
+    is_model_required = isinstance(status, str) and status.strip().lower() == "model_required"
+
+    # The marker goes in front, not just in the prose. A record whose explanation
+    # is a model-written sentence cannot be filtered on, and the one thing a
+    # reader needs to know without parsing prose is that there is no prediction
+    # here at all.
+    if is_model_required:
+        reason = output.output.get("reason")
+        prefix = f"MODEL_REQUIRED{f' ({reason})' if reason else ''}"
+        detail = " ".join(str(note) for note in notes) if isinstance(notes, list) and notes else ""
+        return f"{prefix}: {detail}" if detail else f"{prefix}: no trained weights or implemented inference."
+
+    if isinstance(notes, list) and notes:
+        return " ".join(str(note) for note in notes)
+    if legacy:
+        return str(legacy)
+    return ""
+
+
 class SituationAnalysis(BaseModel):
     event_class: str = "unknown"
     classification_confidence: float = 0.0
@@ -805,7 +877,7 @@ def derive_analysis_metrics(
 
     # Map model outputs
     for m in model_outputs:
-        is_placeholder = bool(m.output.get("is_placeholder", False) or m.output.get("status") == "model_required")
+        is_placeholder = _is_placeholder_output(m.output)
         status_str = "MODEL_REQUIRED" if is_placeholder else "COMPLETED"
         if is_placeholder:
             models_needing_training.append(m.model_id)
@@ -821,13 +893,13 @@ def derive_analysis_metrics(
                 prediction_horizons=[5, 15, 30, 60],
                 predicted_value=m.output.get("forecasts") or m.output.get("p_road") or m.output.get("dominant_class"),
                 probability=m.probability,
-                confidence=round(1.0 - (m.uncertainty or 0.2), 4) if m.uncertainty is not None else 0.8,
+                confidence=_reported_confidence(m),
                 uncertainty=m.uncertainty,
                 calibration_info=m.calibration_version,
                 model_status=status_str,
                 deployment_mode=str(m.output.get("deployment_mode") or "champion"),
                 is_placeholder=is_placeholder,
-                explanation=str(m.output.get("explanation") or ""),
+                explanation=_explanation_of(m),
             )
         )
 

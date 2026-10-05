@@ -134,8 +134,8 @@ def test_untrained_models_require_weights_without_fabrication():
         TimeToImpactModel(is_trained=False),
         TrafficPredictionModel(is_trained=False),
         TransitDisruptionModel(is_trained=False),
-        SpatialPropagationModel(is_trained=False),
-        UserPriorityRankingModel(is_trained=False),
+        SpatialPropagationModel(),
+        UserPriorityRankingModel(),
     ]
 
     ctx = ModelContext(
@@ -160,7 +160,50 @@ def test_untrained_models_require_weights_without_fabrication():
         # Must link to specification doc
         assert "specification" in pred.outputs
         assert pred.outputs["status"] == "MODEL_REQUIRED"
-        assert any("requires trained weights" in note for note in pred.notes)
+        # Each model must state its own actual reason for not answering. "No
+        # weights yet" and "no implementation exists" call for different work,
+        # so a single required phrasing would flatten a distinction the reader
+        # needs. Models F and G have no inference at all and say so.
+        if "reason" in pred.outputs:
+            assert pred.outputs["reason"] == "not_implemented"
+            assert any("no implemented inference" in note for note in pred.notes)
+        else:
+            assert any("requires trained weights" in note for note in pred.notes)
+
+
+def test_models_f_and_g_cannot_be_switched_into_claiming_success():
+    """Models with no inference must not offer a flag that fakes one.
+
+    Their previous ``is_trained=True`` paths returned COMPLETED with empty
+    results - a cascade across zero edges, and a ranking of nothing, both at
+    high confidence. The flag is gone rather than honoured, because with no
+    inference there is no honest value it could take.
+    """
+
+    from infraimpact.models.base import PredictionStatus
+    from infraimpact.models.portfolio import (
+        SpatialPropagationModel,
+        UserPriorityRankingModel,
+    )
+
+    ctx = ModelContext(event_id="evt_test", state_version=1, features={})
+
+    for model, empty_key in (
+        (SpatialPropagationModel(), "propagated_edges"),
+        (UserPriorityRankingModel(), "ranked_item_ids"),
+    ):
+        assert model.is_trained is False
+
+        with pytest.raises(TypeError):
+            model.__class__(is_trained=True)
+
+        pred = model.predict(ctx)
+        assert pred.status == PredictionStatus.MODEL_REQUIRED
+        assert pred.is_placeholder is True
+        assert pred.confidence == 0.0
+        # The empty list is reported as an absence of a prediction, not as one.
+        assert pred.outputs[empty_key] == []
+        assert pred.outputs["reason"] == "not_implemented"
 
 
 def test_model_specifications_exist_and_complete():
@@ -201,3 +244,33 @@ def test_model_specifications_exist_and_complete():
         for kw in required_keywords:
             assert kw.lower() in content.lower(), f"Missing section '{kw}' in {filename}"
 
+
+def test_untrained_models_cannot_be_promoted():
+    """Promotion of a model with no weights is refused, not quietly allowed.
+
+    ``promote`` used to accept any registered model. Promoting an untrained one
+    sent production traffic to a model that answers MODEL_REQUIRED every time,
+    which presents as a healthy deployment that happens to be silent - the
+    monitoring meant to catch a broken model ends up pointed at the model that
+    has none.
+    """
+    from infraimpact.models.base import ModelDeploymentMode
+    from infraimpact.models.portfolio import (
+        BaselineEventClassifier,
+        build_default_model_registry,
+    )
+
+    registry = build_default_model_registry()
+    untrained_id = next(iter(registry.list_models()))["model_id"]
+
+    assert registry.promote(untrained_id, ModelDeploymentMode.CHAMPION) is False
+    assert registry.promote("no-such-model", ModelDeploymentMode.CHAMPION) is False
+
+    # The champion is unchanged after the refusal.
+    task = registry.get(untrained_id).task_type
+    assert registry.get_champion(task).model_id == untrained_id
+
+    # A model with real weights behind it still promotes.
+    registry.register(BaselineEventClassifier())
+    assert registry.promote(untrained_id, ModelDeploymentMode.CHALLENGER) is True
+    assert registry.get(untrained_id).deployment_mode == ModelDeploymentMode.CHALLENGER

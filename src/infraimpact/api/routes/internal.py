@@ -217,9 +217,19 @@ class PromoteModelRequest(BaseModel):
     target_mode: str = Field(description="'champion', 'challenger', or 'shadow'")
 
 
-@router.post("/models/promote", responses={404: {"model": ErrorResponse}})
+@router.post(
+    "/models/promote",
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
 async def post_models_promote(request: Request, payload: PromoteModelRequest) -> dict[str, Any]:
-    """Section 47: promote a model between shadow, challenger, and champion modes."""
+    """Section 47: promote a model between shadow, challenger, and champion modes.
+
+    A model with no trained weights is refused with 409 rather than accepted.
+    Promoting one would route production traffic to a model that answers
+    MODEL_REQUIRED every time, which reads as a working deployment that happens
+    to be silent. Refusing makes the missing weights visible at the point
+    someone tried to ship without them.
+    """
     from ...models.base import ModelDeploymentMode
     runtime = get_runtime(request)
     reg = getattr(runtime.orchestrator, "model_registry", None)
@@ -232,9 +242,21 @@ async def post_models_promote(request: Request, payload: PromoteModelRequest) ->
             status_code=400,
             detail=f"invalid target_mode '{payload.target_mode}'; expected champion, challenger, or shadow",
         )
-    success = reg.promote(payload.model_id, mode)
-    if not success:
+
+    model = reg.get(payload.model_id)
+    if model is None:
         raise HTTPException(status_code=404, detail=f"model '{payload.model_id}' not found in registry")
+
+    if not model.is_trained:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"model '{payload.model_id}' has no trained weights and cannot be promoted; "
+                "it would return MODEL_REQUIRED for every prediction"
+            ),
+        )
+
+    reg.promote(payload.model_id, mode)
     return {
         "model_id": payload.model_id,
         "new_deployment_mode": mode.value,

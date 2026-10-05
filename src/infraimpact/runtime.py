@@ -46,17 +46,20 @@ from typing import Any, Callable, Sequence
 from .analysis.orchestrator import AnalysisOrchestrator, AnalysisOutcome
 from .bus.event_bus import Envelope, EventBus, Topic
 from .config import Settings, get_region, get_settings, workspace_root
-from .delta.engine import compare_user_exposure
+from .delta.engine import DeltaReport, StateDeltaEngine, compare_user_exposure
 from .domain.enums import NotificationReason, TruthStatus, Urgency
 from .domain.ids import utcnow
 from .domain.schemas import (
+    EventLifecycleTransition,
     EventState,
     NotificationCandidate,
     Observation,
     StateDelta,
+    StateDeltaRecord,
     UserContext,
     UserExposure,
     UserImpactState,
+    WorldSnapshot,
 )
 from .events.claims import ClaimExtractor, RuleClaimExtractor
 from .events.resolver import EventResolver
@@ -72,6 +75,7 @@ from .users.exposure import ExposureContext, ExposureEngine
 from .users.notifications import NotificationContext, NotificationEngine
 from .users.presentation import PresentationContext, PresentationEngine
 from .users.priority import PriorityContext, UserPriorityEngine
+from .world.projection import WorldProjection
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +131,10 @@ class CycleResult:
     notifications: int = 0
     suppression: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    #: Cross-event view as of the end of this cycle. ``None`` when the
+    #: projection failed, which is reported as an error rather than as an empty
+    #: world - a missing snapshot and an empty one are different facts.
+    world: WorldSnapshot | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -143,6 +151,8 @@ class CycleResult:
             "notifications": self.notifications,
             "suppression": dict(self.suppression),
             "errors": self.errors,
+            "world_events": self.world.events_total if self.world else None,
+            "world_changed": self.world.events_changed_materially if self.world else None,
         }
 
 
@@ -192,11 +202,21 @@ class Runtime:
             claims=self.repo.claims,
             states=self.repo.states,
             region_id=self.region.region_id,
+            lifecycle=self.repo.lifecycle,
             time_window_min=self.settings.resolver_time_window_min,
             search_radius_m=self.settings.resolver_search_radius_m,
             merge_threshold=self.settings.resolver_merge_threshold,
         )
         self.world = WorldStateEngine(self.repo.states)
+        #: Delta engine used for the durable delta ledger. The orchestrator has
+        #: its own copy for analysis runs; this one exists because deltas must be
+        #: written even when no analysis runs at all - an event can be updated
+        #: during replay or recovery, and a delta that exists only inside an
+        #: ``AnalysisRun`` does not exist for those.
+        self.delta_engine = StateDeltaEngine()
+        #: Cross-event world view. Rebuilt once per cycle rather than per event,
+        #: because a snapshot per event would be a snapshot of one event.
+        self.projection = WorldProjection(self.repo, self.region.region_id)
         self.orchestrator = orchestrator or AnalysisOrchestrator(
             self.repo,
             self.bus,
@@ -363,6 +383,16 @@ class Runtime:
                 result.notifications += outcome.notified
                 for reason, count in outcome.suppressed.items():
                     result.suppression[reason] = result.suppression.get(reason, 0) + count
+
+        # The world view is assembled once, after every event has been processed
+        # and the ledger has settled. Building it per event would describe a
+        # half-updated world; not rebuilding it would leave a snapshot that goes
+        # stale on any cycle where nothing was dirty, which is most cycles.
+        try:
+            result.world = self._refresh_world()
+        except Exception as exc:  # noqa: BLE001 - a read model must not stop ingest
+            log.exception("world projection failed")
+            result.errors.append(f"world: {exc!r}")
 
         result.duration_ms = (time.perf_counter() - started) * 1000.0
         log.info("cycle %d: %s", result.cycle, result.summary())
@@ -542,8 +572,19 @@ class Runtime:
         previous = self.repo.states.latest(event_id)
 
         # new_state = rebuild_state(event, all_relevant_observations)
-        state = self.world.rebuild(event_id, observations, claims, previous, now=utcnow())
-        self.world.persist(state)
+        #
+        # The state version, the deltas that explain it, and the lifecycle
+        # transition it may have caused are written together or not at all.
+        # Separating them lets a crash produce the worst possible outcome: a
+        # state version asserting something that never happened, or deltas
+        # describing a change to a state version that does not exist. Both
+        # states are readable and would both be believed.
+        with self.repo.transaction():
+            state = self.world.rebuild(event_id, observations, claims, previous, now=utcnow())
+            delta_report = self._persist_state_version(
+                event_id, previous, state, observations, claims
+            )
+
         await self.bus.publish(
             Topic.STATE_UPDATED,
             {
@@ -551,6 +592,8 @@ class Runtime:
                 "state_version": state.state_version,
                 "status": state.status,
                 "observations": len(state.observation_ids),
+                "deltas": len(delta_report.deltas),
+                "material": delta_report.is_material,
             },
             key=event_id,
         )
@@ -615,6 +658,124 @@ class Runtime:
             outcome,
         )
         return outcome
+
+    def _persist_state_version(
+        self,
+        event_id: str,
+        previous: EventState | None,
+        state: EventState,
+        observations: Sequence[Observation],
+        claims: Sequence[Any],
+    ) -> DeltaReport:
+        """Write one state version with its deltas and lifecycle transition.
+
+        All three are one fact - "this is what we now believe, how it differs
+        from what we believed, and why the event's status is what it is" - and
+        are written inside the caller's transaction so the ledger can never be
+        observed disagreeing with itself.
+
+        The delta report is returned rather than discarded because the caller
+        publishes it, and because analysis reuses the same comparison; computing
+        it twice would be free to do but would leave two subtly different
+        opinions about what changed in the same cycle.
+        """
+
+        report = self.delta_engine.compare(
+            previous,
+            state,
+            impacts=state.affected_infrastructure,
+            previous_impacts=previous.affected_infrastructure if previous else (),
+            affected_user_count=len(self.repo.users.all()),
+        )
+
+        self.world.persist(state)
+
+        recorded_at = state.reconstructed_at
+        records = [
+            StateDeltaRecord.from_delta(
+                delta,
+                event_id=event_id,
+                state_version=state.state_version,
+                previous_state_version=previous.state_version if previous else None,
+                region_id=self.region.region_id,
+                is_material=delta.magnitude >= self.delta_engine.materiality_floor,
+                recorded_at=recorded_at,
+            )
+            for delta in report.deltas
+        ]
+        if records:
+            self.repo.deltas.append_many(records)
+
+        self._record_lifecycle(event_id, previous, state)
+        return report
+
+    def _record_lifecycle(
+        self, event_id: str, previous: EventState | None, state: EventState
+    ) -> None:
+        """Log a lifecycle transition when the status actually moves.
+
+        One transition per rebuild, not one per assessment. The lifecycle engine
+        re-evaluates on every state version, and most of those evaluations
+        conclude that nothing changed; logging each one would turn the table into
+        a heartbeat and bury the transitions it exists to record. The
+        ``previous`` argument is what makes "actually moves" checkable rather
+        than assumed.
+
+        The status on the event row is written from the same
+        :class:`~infraimpact.domain.schemas.LifecycleAssessment` that went into
+        the state version, so the event table, the state version and this log
+        cannot disagree about what happened.
+        """
+
+        before = previous.status if previous else None
+        if before == state.status:
+            return
+
+        transition = EventLifecycleTransition(
+            event_id=event_id,
+            region_id=self.region.region_id,
+            from_status=before,
+            to_status=state.status,
+            reason=state.lifecycle.reason,
+            termination_basis=state.lifecycle.termination_basis,
+            confidence=state.lifecycle.confidence,
+            evidence_observation_ids=state.lifecycle.evidence_observation_ids,
+            silence_threshold_seconds=state.lifecycle.silence_threshold_seconds,
+            observation_count=len(state.observation_ids),
+            state_version=state.state_version,
+            at=state.reconstructed_at,
+        )
+        self.repo.lifecycle.record(transition)
+        self.repo.events.set_status(
+            event_id, state.status, state.reconstructed_at, state.lifecycle.reason
+        )
+        log.info(
+            "lifecycle %s -> %s for %s (%s)",
+            before,
+            state.status,
+            event_id,
+            state.lifecycle.termination_basis,
+        )
+
+    def _refresh_world(self) -> WorldSnapshot:
+        """Rebuild and store the cross-event world view for this cycle.
+
+        Once per cycle, after every event has been processed, so the snapshot
+        describes a settled set of state versions rather than a partially
+        updated one. Reading latest states inside the projection also keeps it
+        correct on a cycle where nothing was dirty, which is the common case and
+        the one that keeps ``observation_total`` honest.
+        """
+
+        snapshot = self.projection.snapshot(now=utcnow())
+        log.info(
+            "world snapshot %s: %d events (%d changed), %d observations",
+            snapshot.snapshot_id,
+            snapshot.events_total,
+            snapshot.events_changed_materially,
+            snapshot.observation_total,
+        )
+        return snapshot
 
     # -- stage 3: the user loop -------------------------------------------
 

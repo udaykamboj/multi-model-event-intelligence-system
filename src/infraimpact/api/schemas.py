@@ -27,6 +27,7 @@ from ..domain.schemas import (
     Observation,
     PresentationItem,
     RouteImpact,
+    WorldEventEntry,
 )
 
 
@@ -299,6 +300,40 @@ class ErrorResponse(BaseModel):
     code: Literal["not_found", "invalid_request", "unavailable"] = "not_found"
 
 
+class WorldResponse(BaseModel):
+    """What is happening in the region right now.
+
+    Deliberately not a bare list of events. ``events_total`` says how much the
+    platform is watching and ``events_changed_materially`` says what needs
+    attention; reporting only the first would make a thousand quiet events look
+    like a crisis, and reporting only the second would make a hundred unchanged
+    ones look like calm. Both are answers to different questions and the caller
+    usually needs both.
+
+    ``observation_total`` and ``generated_at`` are what make staleness
+    detectable. ``coverage_gaps`` is what keeps "nothing is happening" from
+    being mistaken for "nothing is happening *and we can see*".
+    """
+
+    snapshot_id: str
+    region_id: str
+    generated_at: datetime
+    observation_total: int = 0
+
+    events_total: int = 0
+    events_active: int = 0
+    events_quiescent: int = 0
+    events_closed: int = 0
+    events_changed_materially: int = 0
+
+    events: list[WorldEventEntry] = Field(default_factory=list)
+    domain_activity: dict[str, int] = Field(default_factory=dict)
+
+    source_health: dict[str, str] = Field(default_factory=dict)
+    sources_degraded: list[str] = Field(default_factory=list)
+    coverage_gaps: list[str] = Field(default_factory=list)
+
+
 __all__ = [
     "AnalysisResponse",
     "AnalysisView",
@@ -312,6 +347,7 @@ __all__ = [
     "NotificationListResponse",
     "NotificationView",
     "RecentChange",
+    "WorldResponse",
     "RegionStateResponse",
     "RouteImpactResponse",
     "RouteImpactView",

@@ -36,20 +36,38 @@ class ModelRegistry:
         self._champions: dict[ModelTaskType, str] = {}
 
     def register(self, model: PredictiveModel) -> PredictiveModel:
-        """Register a model instance in the registry."""
+        """Register a model instance in the registry.
+
+        The first model registered for a task type becomes its champion, because
+        something has to answer for that task. If it has no trained weights that
+        is logged loudly rather than treated as normal: an untrained champion is
+        a legitimate configuration for a fresh deployment, but it is a fact
+        about the deployment worth surfacing, not a detail.
+        """
+
         model_id = model.model_id
         task_type = model.task_type
         self._models[model_id] = model
 
         if model.deployment_mode == ModelDeploymentMode.CHAMPION or task_type not in self._champions:
             self._champions[task_type] = model_id
+            if not model.is_trained:
+                log.warning(
+                    "model %s is the champion for %s but has no trained weights; "
+                    "predictions for this task will report MODEL_REQUIRED until "
+                    "it is trained. This is expected on a fresh deployment and "
+                    "not expected to persist.",
+                    model_id,
+                    task_type.value,
+                )
 
         log.info(
-            "registered model: id=%s task=%s version=%s mode=%s",
+            "registered model: id=%s task=%s version=%s mode=%s trained=%s",
             model_id,
             task_type,
             model.version,
             model.deployment_mode,
+            model.is_trained,
         )
         return model
 
@@ -79,9 +97,34 @@ class ModelRegistry:
         ]
 
     def promote(self, model_id: str, new_mode: ModelDeploymentMode) -> bool:
-        """Promote or switch a model's deployment mode (e.g. shadow -> challenger -> champion)."""
+        """Promote or switch a model's deployment mode (e.g. shadow -> challenger -> champion).
+
+        Refuses to promote a model that has no trained weights, and says why.
+        A model without weights returns ``MODEL_REQUIRED`` from every call, so
+        promoting one does not improve anything - it only routes production
+        traffic to a model that is guaranteed to answer nothing. It also makes
+        the absence invisible: a champion that returns a placeholder looks
+        exactly like a champion that is merely quiet, and the monitoring meant
+        to catch a broken model is now pointed at the model that has none.
+
+        ``is_trained`` is a caller-supplied flag, so this is a guard against
+        accidental promotion rather than proof. The deeper protection is that no
+        model in the portfolio can claim ``is_trained=True`` without an
+        implemented inference behind it.
+        """
+
         model = self._models.get(model_id)
         if not model:
+            return False
+
+        if not model.is_trained:
+            log.warning(
+                "refusing to promote %s to %s: no trained weights. It would return "
+                "MODEL_REQUIRED for every prediction. Train and evaluate the model "
+                "first, then promote.",
+                model_id,
+                new_mode.value,
+            )
             return False
 
         # Create updated metadata
@@ -99,6 +142,7 @@ class ModelRegistry:
             code_commit=model.metadata.code_commit,
             artifact_checksum=model.metadata.artifact_checksum,
             deployed_at=model.metadata.deployed_at,
+            specification_doc=model.metadata.specification_doc,
         )
         # Update metadata on model
         object.__setattr__(model, "metadata", updated_meta) if hasattr(model, "metadata") else None
@@ -122,6 +166,7 @@ class ModelRegistry:
                     code_commit=old_model.metadata.code_commit,
                     artifact_checksum=old_model.metadata.artifact_checksum,
                     deployed_at=old_model.metadata.deployed_at,
+                    specification_doc=old_model.metadata.specification_doc,
                 )
                 object.__setattr__(old_model, "metadata", demoted_meta)
             self._champions[model.task_type] = model_id

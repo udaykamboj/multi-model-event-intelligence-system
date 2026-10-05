@@ -536,14 +536,27 @@ class BaselineTransitDisruptionModel(TransitDisruptionModel):
 
 
 class SpatialPropagationModel(PredictiveModel):
-    """Model F (section 27): network cascade propagation across road/transit edges."""
+    """Model F (section 27): network cascade propagation across road/transit edges.
+
+    Not implemented. The class exists so the portfolio has the right shape and
+    so section 27's contract is testable, but there is no cascade-propagation
+    inference here - only a specification. It therefore takes no ``is_trained``
+    flag: with no implementation, no setting of that flag could honestly make
+    this model capable of a prediction, and accepting it would only invite a
+    caller to declare success it did not earn.
+
+    The previous version did exactly that. ``is_trained=True`` returned
+    ``COMPLETED`` with ``propagated_edges=[]``, ``max_hops=0`` and confidence
+    0.80 - a cascade across zero edges reported as a confident finding. Cascade
+    propagation is the kind of claim that, believed, sends someone down the
+    wrong road, so an empty result is not a safe default here; it is the most
+    dangerous one.
+    """
 
     def __init__(
         self,
         mode: ModelDeploymentMode = ModelDeploymentMode.CHAMPION,
         version: str = "v1.0.0",
-        *,
-        is_trained: bool = False,
     ) -> None:
         super().__init__(
             ModelMetadata(
@@ -561,22 +574,38 @@ class SpatialPropagationModel(PredictiveModel):
                 calibration_model="graph-conformal-v1",
                 specification_doc="docs/models/MODEL_F_SPATIAL_PROPAGATION.md",
             ),
-            is_trained=is_trained,
+            is_trained=False,
         )
 
     def predict(self, context: ModelContext) -> ModelPrediction:
-        if not self.is_trained:
-            return self.untrained_prediction(context)
+        return self._unimplemented(context)
 
+    def _unimplemented(self, context: ModelContext) -> ModelPrediction:
+        spec = self.metadata.specification_doc
         return ModelPrediction(
             model_id=self.model_id,
             model_version=self.version,
             task_type=self.task_type,
             deployment_mode=self.deployment_mode,
-            status=PredictionStatus.COMPLETED,
-            is_placeholder=False,
-            outputs={"propagated_edges": [], "max_hops": 0},
-            confidence=0.80,
+            status=PredictionStatus.MODEL_REQUIRED,
+            is_placeholder=True,
+            outputs={
+                "status": "MODEL_REQUIRED",
+                "reason": "not_implemented",
+                "specification": spec,
+                "required_features": list(self.metadata.feature_schema),
+                "propagated_edges": [],
+                "max_hops": 0,
+            },
+            confidence=0.0,
+            uncertainty=1.0,
+            notes=[
+                f"Model '{self.model_id}' has no implemented inference in this "
+                f"build - only its specification at {spec}. It reports no "
+                "propagation rather than reporting an empty propagation as a "
+                "result. Note that 'no cascade observed' and 'not modelled' are "
+                "different claims, and only the first is a prediction.",
+            ],
         )
 
 
@@ -586,14 +615,22 @@ class SpatialPropagationModel(PredictiveModel):
 
 
 class UserPriorityRankingModel(PredictiveModel):
-    """Model G (section 36): Learning-to-Rank presentation item personalization."""
+    """Model G (section 36): Learning-to-Rank presentation item personalization.
+
+    Not implemented, for the same reason as Model F. There is no ranker here,
+    only a specification, so there is no ``is_trained`` flag to mislead anyone.
+    Its previous ``is_trained=True`` path returned ``COMPLETED`` with an empty
+    ``ranked_item_ids`` list at confidence 0.85 - a learned ranking that ranked
+    nothing, at high confidence, in the one component that decides what a person
+    is shown first. Presenting order is a safety-relevant default as much as a
+    convenience, so the honest empty answer and the empty-result fake have to be
+    told apart, and this model tells them apart by refusing to answer.
+    """
 
     def __init__(
         self,
         mode: ModelDeploymentMode = ModelDeploymentMode.CHAMPION,
         version: str = "v1.0.0",
-        *,
-        is_trained: bool = False,
     ) -> None:
         super().__init__(
             ModelMetadata(
@@ -613,36 +650,54 @@ class UserPriorityRankingModel(PredictiveModel):
                 calibration_model="monotonic-rank-v1",
                 specification_doc="docs/models/MODEL_G_USER_PRIORITY_RANKING.md",
             ),
-            is_trained=is_trained,
+            is_trained=False,
         )
 
     def predict(self, context: ModelContext) -> ModelPrediction:
-        if not self.is_trained:
-            return self.untrained_prediction(context)
+        return self._unimplemented(context)
 
+    def _unimplemented(self, context: ModelContext) -> ModelPrediction:
+        spec = self.metadata.specification_doc
         return ModelPrediction(
             model_id=self.model_id,
             model_version=self.version,
             task_type=self.task_type,
             deployment_mode=self.deployment_mode,
-            status=PredictionStatus.COMPLETED,
-            is_placeholder=False,
-            outputs={"ranked_item_ids": []},
-            confidence=0.85,
+            status=PredictionStatus.MODEL_REQUIRED,
+            is_placeholder=True,
+            outputs={
+                "status": "MODEL_REQUIRED",
+                "reason": "not_implemented",
+                "specification": spec,
+                "required_features": list(self.metadata.feature_schema),
+                "ranked_item_ids": [],
+            },
+            confidence=0.0,
+            uncertainty=1.0,
+            notes=[
+                f"Model '{self.model_id}' has no implemented inference in this "
+                f"build - only its specification at {spec}. Ranking falls back "
+                "to the deterministic priority rules, which are auditable; an "
+                "empty learned ranking at high confidence would not be.",
+            ],
         )
 
 
 def build_default_model_registry(*, require_trained: bool = True) -> Any:
     """Build and populate the default ModelRegistry with champion models.
 
-    When require_trained=True:
+    When require_trained=True (the default, and what production uses):
       Registers the models in their clean, un-trained state where they return
       PredictionStatus.MODEL_REQUIRED and zero fabricated forecasts, pointing
       directly to their documentation specifications.
 
     When require_trained=False:
       Registers baseline reference models enabled for testing and mathematical
-      baseline evaluation.
+      baseline evaluation. Models A-E have hand-built deterministic baselines to
+      measure learned models against; Models F and G have none, so they register
+      in the same unimplemented state as above rather than registering an empty
+      result that would read as a baseline score of zero when it means
+      "not measured".
     """
     from .registry import ModelRegistry
 
@@ -653,16 +708,16 @@ def build_default_model_registry(*, require_trained: bool = True) -> Any:
         registry.register(TimeToImpactModel(is_trained=False))
         registry.register(TrafficPredictionModel(is_trained=False))
         registry.register(TransitDisruptionModel(is_trained=False))
-        registry.register(SpatialPropagationModel(is_trained=False))
-        registry.register(UserPriorityRankingModel(is_trained=False))
+        registry.register(SpatialPropagationModel())
+        registry.register(UserPriorityRankingModel())
     else:
         registry.register(BaselineEventClassifier())
         registry.register(BaselineInfrastructureImpactModel())
         registry.register(BaselineTimeToImpactModel())
         registry.register(BaselineTrafficPredictionModel())
         registry.register(BaselineTransitDisruptionModel())
-        registry.register(SpatialPropagationModel(is_trained=True))
-        registry.register(UserPriorityRankingModel(is_trained=True))
+        registry.register(SpatialPropagationModel())
+        registry.register(UserPriorityRankingModel())
     return registry
 
 

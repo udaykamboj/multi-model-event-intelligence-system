@@ -170,14 +170,33 @@ class PredictiveModel(abc.ABC):
         )
 
     def to_model_output(self, prediction: ModelPrediction, state_version: int) -> ModelOutput:
-        """Create a section 44 compliant ModelOutput row."""
+        """Create a section 44 compliant ModelOutput row.
+
+        ``status`` and ``is_placeholder`` are merged in from the typed
+        prediction rather than trusted to whatever the model happened to write
+        into ``outputs``. They used to be dropped, which left a hand-written
+        string inside the free-form payload as the only evidence that a model had
+        no weights - and the consumer compared that string against a
+        differently-cased one, so every untrained model was reported as having
+        completed successfully. Carrying the enum through removes the string
+        comparison entirely.
+        """
+
+        output = {
+            **prediction.outputs,
+            "status": prediction.status.value,
+            "is_placeholder": prediction.is_placeholder,
+            "task_type": prediction.task_type.value,
+            "deployment_mode": prediction.deployment_mode.value,
+            "notes": list(prediction.notes),
+        }
         return ModelOutput(
             model_id=self.model_id,
             model_version=self.version,
             prediction_time=utcnow(),
             input_state_version=state_version,
             features_version=prediction.features_version,
-            output=prediction.outputs,
+            output=output,
             probability=prediction.confidence,
             uncertainty=prediction.uncertainty,
             calibration_version=prediction.calibration_version,

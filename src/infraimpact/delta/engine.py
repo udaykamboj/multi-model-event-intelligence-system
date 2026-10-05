@@ -52,6 +52,44 @@ _SEVERITY_MATERIAL_GAP = 1
 #: Forecast movement smaller than this is noise, not a change in belief.
 _FORECAST_MATERIAL_GAP = 0.15
 
+#: Ratio change below this is treated as re-reporting the same figure.
+_MAGNITUDE_NOISE_RATIO = 0.05
+
+
+def _magnitude_ratio(
+    before: Any, after: Any
+) -> tuple[float, float, float] | None:
+    """Ratio between two primary magnitude estimates, if it means anything.
+
+    Returns ``None`` rather than a guess whenever a comparison cannot be made
+    honestly: no estimate on one side, an estimate marked unavailable on either
+    side, or a change in *which* quantity is being measured. That last case is
+    the important one - an event whose primary estimate switches from a
+    distance to a count has not "grown", it has been re-described, and reporting
+    that as a ratio would compare numbers that do not mean the same thing. The
+    caller reports nothing instead, which is the correct answer.
+
+    Comparing against zero is excluded rather than guarded: a ratio against zero
+    is unbounded, so the magnitude would saturate at 1.0 and lose the difference
+    between "appeared" and "doubled".
+    """
+
+    if before is None or after is None:
+        return None
+    if getattr(before, "unavailable", False) or getattr(after, "unavailable", False):
+        return None
+    if before.quantity != after.quantity or before.unit != after.unit:
+        return None
+    previous_value, current_value = before.value, after.value
+    if previous_value is None or current_value is None:
+        return None
+    if previous_value <= 0.0 or current_value <= 0.0:
+        return None
+    ratio = current_value / previous_value
+    if abs(ratio - 1.0) < _MAGNITUDE_NOISE_RATIO:
+        return None
+    return ratio, previous_value, current_value
+
 
 @dataclass
 class DeltaReport:
@@ -146,6 +184,8 @@ class StateDeltaEngine:
         deltas.extend(self._geometry(previous, current, report.causes))
         deltas.extend(self._movement(previous, current, report.causes))
         deltas.extend(self._classification(previous, current, report.causes))
+        deltas.extend(self._scale(previous, current, report.causes))
+        deltas.extend(self._lifecycle(previous, current, report.causes))
         deltas.extend(
             self._infrastructure(
                 previous_impacts or previous.affected_infrastructure,
@@ -479,6 +519,114 @@ class StateDeltaEngine:
     ) -> tuple[str, ...]:
         seen = set(previous.observation_ids)
         return tuple(oid for oid in current.observation_ids if oid not in seen)
+
+    def _scale(
+        self, previous: EventState, current: EventState, causes: Sequence[str]
+    ) -> list[StateDelta]:
+        """How big it got, and how fast it is still growing.
+
+        Both changes matter for different reasons and neither implies the other.
+        A magnitude that jumps while reports stay flat is a re-estimate of the
+        same facts - often a source correction, and worth flagging precisely
+        because no new reports arrived. A rate that rises while magnitude holds
+        steady is a situation escalating in attention or in coverage, which is a
+        different fact and often the earlier warning.
+
+        Magnitude is compared on ratio rather than difference because "twice as
+        large" is the meaningful claim across quantities whose units are not
+        comparable to each other. A difference is meaningless between a
+        percentage and a kilometre; a ratio is meaningful within either.
+        """
+
+        out: list[StateDelta] = []
+        before = previous.scale.primary
+        after = current.scale.primary
+        if _magnitude_ratio(before, after) is not None:
+            ratio, previous_value, current_value = _magnitude_ratio(before, after)
+            out.append(
+                StateDelta(
+                    change="scale_magnitude_changed",
+                    domain="scale",
+                    before={"quantity": before.quantity, "value": previous_value} if before else None,
+                    after={"quantity": after.quantity, "value": current_value},
+                    magnitude=min(1.0, abs(ratio - 1.0)),
+                    confidence=after.confidence if after else 0.0,
+                    novelty=0.4,
+                    causes=causes,
+                    official_guidance=False,
+                    urgency=Urgency.NONE,
+                    affected_user_count=0,
+                )
+            )
+
+        previous_rate = previous.scale.rate.observation_rate_per_hour
+        current_rate = current.scale.rate.observation_rate_per_hour
+        if previous_rate > 0.0 and current_rate > 0.0:
+            ratio = current_rate / previous_rate
+            out.append(
+                StateDelta(
+                    change="scale_rate_changed",
+                    domain="scale",
+                    before=previous_rate,
+                    after=current_rate,
+                    magnitude=min(1.0, abs(ratio - 1.0)),
+                    confidence=0.6,
+                    novelty=0.3,
+                    causes=causes,
+                    official_guidance=False,
+                    urgency=Urgency.NONE,
+                    affected_user_count=0,
+                )
+            )
+        elif previous_rate == 0.0 < current_rate:
+            out.append(
+                StateDelta(
+                    change="scale_rate_established",
+                    domain="scale",
+                    before=None,
+                    after=current_rate,
+                    magnitude=0.2,
+                    confidence=0.5,
+                    novelty=0.5,
+                    causes=causes,
+                    official_guidance=False,
+                    urgency=Urgency.NONE,
+                    affected_user_count=0,
+                )
+            )
+        return out
+
+    def _lifecycle(
+        self, previous: EventState, current: EventState, causes: Sequence[str]
+    ) -> list[StateDelta]:
+        """Lifecycle decisions, reported with their basis and confidence.
+
+        ``_status`` already reports the status transition. This records *why*,
+        which is the part a user or an auditor actually needs: an event closed
+        because an official record said so and an event closed because nobody
+        mentioned it again are different facts with very different confidence,
+        and reporting both as "status changed to closed" throws that away.
+        """
+
+        before, after = previous.lifecycle, current.lifecycle
+        if before.status == after.status and before.reason == after.reason:
+            return []
+        return [
+            StateDelta(
+                change="lifecycle_reassessed",
+                domain="lifecycle",
+                before={"status": before.status, "basis": before.termination_basis},
+                after={"status": after.status, "basis": after.termination_basis},
+                magnitude=0.3 if after.status != before.status else 0.1,
+                confidence=after.confidence,
+                novelty=0.2,
+                causes=after.evidence_observation_ids or causes,
+                official_guidance=after.termination_basis
+                in ("official_release", "resolution_record"),
+                urgency=Urgency.NONE,
+                affected_user_count=0,
+            )
+        ]
 
     def _finish(self, report: DeltaReport) -> DeltaReport:
         if not report.deltas:

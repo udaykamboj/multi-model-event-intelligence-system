@@ -114,11 +114,30 @@ class EventClassificationCapability(AnalysisCapability):
 
 
 class TrafficAnomalyCapability(AnalysisCapability):
-    """Section 25: counterfactual baseline, and no causal claim.
+    """Counterfactual baseline and traffic anomaly detection.
 
-    Traffic anomaly = observed - expected. It is emphatically *not* attributed
-    to the event without a validated attribution model, because a downtown
-    anomaly at rush hour has many candidate causes.
+    Reports deviation from an expectation; never attributes the deviation to this
+    event (section 25).
+
+    The honest boundary here is measurement. A road closure makes congestion
+    *likely*, and it says nothing about whether congestion is happening or how
+    bad it is. This capability previously crossed that line in three ways, each
+    of which produced numbers that looked measured and were not:
+
+      - With a closure but no traffic observation it set the observed ratio to
+        0.45 x baseline and confidence 0.70. That is a fabricated measurement,
+        and it was indistinguishable downstream from one that had been observed.
+      - It converted ratios to mph by multiplying by an invented 35 mph
+        free-flow speed, then derived travel time and delay from a hardcoded
+        600 s nominal. The segment's actual free-flow speed was never known.
+      - With no affected segments identified it reported the literal identifier
+        ``road:4th-ave``, naming a specific real street that appeared nowhere in
+        the evidence.
+
+    So: the baseline table below is still emitted, because an expectation is a
+    fact about expectations. Observed quantities are emitted only when an
+    observation actually carries them. When nothing has been measured, this
+    reports that nothing has been measured, and that is a complete answer.
     """
 
     capability_id = "traffic_anomaly"
@@ -130,8 +149,10 @@ class TrafficAnomalyCapability(AnalysisCapability):
     estimated_cost = 0.1
     model_version = "baseline-expected-v1"
 
-    #: Baseline congestion by weekday x period. Replace with a fitted model
-    #: trained through ``infraimpact.evaluation`` as data accumulates.
+    #: Expected speed ratio (observed / free-flow) by weekday x period. An
+    #: explicit, inspectable prior to be replaced by a fitted model through
+    #: ``infraimpact.evaluation``. Replace with a fitted model trained through
+    #: ``infraimpact.evaluation`` as data accumulates.
     BASELINE = {
         ("weekday", "am_peak"): 0.85,
         ("weekday", "midday"): 0.5,
@@ -143,126 +164,154 @@ class TrafficAnomalyCapability(AnalysisCapability):
         ("weekend", "evening"): 0.3,
     }
 
+    #: Ratio thresholds for naming a congestion level. Declared here rather than
+    #: inlined so the classification is auditable as a policy choice.
+    CONGESTION_BANDS = (
+        (0.40, "GRIDLOCK"),
+        (0.60, "SEVERE"),
+        (0.75, "MODERATE"),
+        (0.90, "MINOR"),
+    )
+
     def run(self, ctx: CapabilityContext) -> CapabilityResult:
         result = CapabilityResult()
-        observed = [
-            float(o.structured_payload.get("speed_ratio") or o.structured_payload.get("congestion_ratio") or 0.0)
-            for o in ctx.observations
-            if o.observation_type in {ObservationType.TRAFFIC_CONDITION, ObservationType.TRAFFIC_FLOW}
-            and (o.structured_payload.get("speed_ratio") or o.structured_payload.get("congestion_ratio"))
-        ]
         expected = self.BASELINE.get(self._period(ctx), 0.5)
-        base_speed = round(expected * 35.0, 1)
 
-        has_closure = any(
-            o.observation_type == ObservationType.ROAD_CLOSURE for o in ctx.observations
-        ) or any(
+        observed = self._observed_ratios(ctx)
+        speeds = self._observed_speeds(ctx)
+        travel_times = self._observed_travel_times(ctx)
+
+        has_closure = any(o.observation_type == ObservationType.ROAD_CLOSURE for o in ctx.observations) or any(
             i.domain == InfrastructureDomain.ROAD for i in ctx.state.affected_infrastructure
         )
-
-        if observed:
-            mean_observed = sum(observed) / len(observed)
-            cur_speed = round(mean_observed * 35.0, 1)
-            confidence = min(1.0, 0.4 + 0.15 * len(observed))
-        elif has_closure:
-            mean_observed = round(expected * 0.45, 4)
-            cur_speed = round(base_speed * 0.45, 1)
-            confidence = 0.70
-        else:
-            mean_observed = expected
-            cur_speed = base_speed
-            confidence = 0.50
-
-        anomaly = round(mean_observed - expected, 4)
-        speed_ratio = round(cur_speed / max(1.0, base_speed), 4)
-        flow_ratio = min(speed_ratio, round(cur_speed / 35.0, 4))
-
-        # Congestion classification
-        if flow_ratio < 0.40:
-            cong_level = "GRIDLOCK"
-        elif flow_ratio < 0.60:
-            cong_level = "SEVERE"
-        elif flow_ratio < 0.75:
-            cong_level = "MODERATE"
-        elif flow_ratio < 0.90:
-            cong_level = "MINOR"
-        else:
-            cong_level = "NORMAL"
-
-        nominal_travel_time_s = 600.0
-        cur_travel_time_s = round(nominal_travel_time_s / max(0.2, flow_ratio), 1)
-        delay_sec = round(max(0.0, cur_travel_time_s - nominal_travel_time_s), 1)
-        delay_pct = round((delay_sec / nominal_travel_time_s) * 100.0, 1)
-
+        # Only identifiers the evidence actually carries. No invented segments.
         affected_segments = [
             i.identifier for i in ctx.state.affected_infrastructure if i.domain == InfrastructureDomain.ROAD
         ]
-        if not affected_segments and has_closure:
-            affected_segments = ["road:4th-ave"]
 
-        result.features.update(
-            {
-                "traffic_observed": FeatureValue(name="traffic_observed", value=round(mean_observed, 4)),
-                "traffic_baseline": FeatureValue(name="traffic_baseline", value=expected),
-                "traffic_anomaly": FeatureValue(
-                    name="traffic_anomaly",
-                    value=anomaly,
-                    confidence=confidence,
-                ),
-                "traffic_current_speed_mph": FeatureValue(
-                    name="traffic_current_speed_mph",
-                    value=cur_speed,
-                    unit="mph",
-                    confidence=confidence,
-                ),
-                "traffic_expected_baseline_speed_mph": FeatureValue(
+        # The expectation is reportable either way; it describes the baseline,
+        # not the world.
+        result.features["traffic_baseline_expected_ratio"] = FeatureValue(
+            name="traffic_baseline_expected_ratio",
+            value=expected,
+            unit="ratio",
+            as_of=ctx.state.last_observed or utcnow(),
+        )
+
+        if affected_segments:
+            result.features["traffic_affected_road_segments"] = FeatureValue(
+                name="traffic_affected_road_segments",
+                value=affected_segments,
+            )
+
+        if not observed and not speeds and not travel_times:
+            return self._unmeasured(
+                result,
+                ctx,
+                expected=expected,
+                has_closure=has_closure,
+                affected_segments=affected_segments,
+            )
+
+        # Ratio scale: from real ratios, or from real speeds over a real
+        # free-flow reference. Never from an assumed free-flow speed.
+        if observed:
+            measured_ratio = sum(observed) / len(observed)
+            ratio_confidence = min(1.0, 0.4 + 0.15 * len(observed))
+            ratio_basis = f"{len(observed)} reported speed ratio(s)"
+        elif speeds and speeds[0]["free_flow_mph"]:
+            measured_ratio = sum(s["speed_mph"] / s["free_flow_mph"] for s in speeds) / len(speeds)
+            ratio_confidence = min(1.0, 0.4 + 0.15 * len(speeds))
+            ratio_basis = f"{len(speeds)} reported speed(s) over reported free-flow"
+        else:
+            measured_ratio = None
+            ratio_confidence = 0.0
+            ratio_basis = "no speed ratio or free-flow reference available"
+
+        if measured_ratio is not None:
+            anomaly = round(measured_ratio - expected, 4)
+            cong_level = self._congestion_level(measured_ratio)
+
+            result.features["traffic_observed_speed_ratio"] = FeatureValue(
+                name="traffic_observed_speed_ratio",
+                value=round(measured_ratio, 4),
+                unit="ratio",
+                confidence=ratio_confidence,
+                as_of=ctx.state.last_observed or utcnow(),
+            )
+            result.features["traffic_anomaly"] = FeatureValue(
+                name="traffic_anomaly",
+                value=anomaly,
+                unit="ratio",
+                confidence=ratio_confidence,
+                as_of=ctx.state.last_observed or utcnow(),
+            )
+            result.features["traffic_congestion_level"] = FeatureValue(
+                name="traffic_congestion_level",
+                value=cong_level,
+                confidence=ratio_confidence,
+            )
+            result.features["traffic_measurement_available"] = FeatureValue(
+                name="traffic_measurement_available",
+                value=True,
+                confidence=1.0,
+            )
+
+        # Absolute speeds only when absolute speeds were reported.
+        current_speed = base_speed = None
+        if speeds:
+            current_speed = round(sum(s["speed_mph"] for s in speeds) / len(speeds), 1)
+            result.features["traffic_current_speed_mph"] = FeatureValue(
+                name="traffic_current_speed_mph",
+                value=current_speed,
+                unit="mph",
+                confidence=min(1.0, 0.4 + 0.15 * len(speeds)),
+                as_of=ctx.state.last_observed or utcnow(),
+            )
+            if all(s["free_flow_mph"] for s in speeds):
+                base_speed = round(sum(s["free_flow_mph"] for s in speeds) / len(speeds), 1)
+                result.features["traffic_expected_baseline_speed_mph"] = FeatureValue(
                     name="traffic_expected_baseline_speed_mph",
                     value=base_speed,
                     unit="mph",
-                ),
-                "traffic_speed_anomaly_mph": FeatureValue(
-                    name="traffic_speed_anomaly_mph",
-                    value=round(cur_speed - base_speed, 1),
-                    unit="mph",
-                ),
-                "traffic_speed_anomaly_ratio": FeatureValue(
-                    name="traffic_speed_anomaly_ratio",
-                    value=speed_ratio,
-                    unit="ratio",
-                ),
-                "traffic_travel_time_seconds": FeatureValue(
-                    name="traffic_travel_time_seconds",
-                    value=cur_travel_time_s,
-                    unit="seconds",
-                ),
-                "traffic_baseline_travel_time_seconds": FeatureValue(
+                )
+
+        # Travel time and delay only when travel time and free-flow were
+        # reported. Delay is the difference between two measurements.
+        delay_sec = delay_pct = None
+        if travel_times:
+            current_tt = round(sum(t["travel_time_s"] for t in travel_times) / len(travel_times), 1)
+            result.features["traffic_travel_time_seconds"] = FeatureValue(
+                name="traffic_travel_time_seconds",
+                value=current_tt,
+                unit="seconds",
+                as_of=ctx.state.last_observed or utcnow(),
+            )
+            free_flow_tt = [t["free_flow_s"] for t in travel_times if t["free_flow_s"]]
+            if free_flow_tt:
+                nominal = round(sum(free_flow_tt) / len(free_flow_tt), 1)
+                result.features["traffic_baseline_travel_time_seconds"] = FeatureValue(
                     name="traffic_baseline_travel_time_seconds",
-                    value=nominal_travel_time_s,
+                    value=nominal,
                     unit="seconds",
-                ),
-                "traffic_delay_seconds": FeatureValue(
+                )
+                delay_sec = round(max(0.0, current_tt - nominal), 1)
+                delay_pct = round((delay_sec / nominal) * 100.0, 1) if nominal else None
+                result.features["traffic_delay_seconds"] = FeatureValue(
                     name="traffic_delay_seconds",
                     value=delay_sec,
                     unit="seconds",
-                ),
-                "traffic_delay_percentage": FeatureValue(
-                    name="traffic_delay_percentage",
-                    value=delay_pct,
-                    unit="percent",
-                ),
-                "traffic_congestion_level": FeatureValue(
-                    name="traffic_congestion_level",
-                    value=cong_level,
-                ),
-                "traffic_affected_road_segments": FeatureValue(
-                    name="traffic_affected_road_segments",
-                    value=affected_segments,
-                ),
-                "traffic_confidence": FeatureValue(
-                    name="traffic_confidence",
-                    value=confidence,
-                ),
-            }
+                )
+                if delay_pct is not None:
+                    result.features["traffic_delay_percentage"] = FeatureValue(
+                        name="traffic_delay_percentage",
+                        value=delay_pct,
+                        unit="percent",
+                    )
+
+        result.features["traffic_confidence"] = FeatureValue(
+            name="traffic_confidence",
+            value=ratio_confidence,
         )
 
         result.model_outputs.append(
@@ -272,24 +321,157 @@ class TrafficAnomalyCapability(AnalysisCapability):
                 prediction_time=utcnow(),
                 input_state_version=ctx.state.state_version,
                 output={
-                    "current_speed_mph": cur_speed,
-                    "baseline_speed_mph": base_speed,
-                    "speed_ratio": speed_ratio,
-                    "congestion_level": cong_level,
+                    "status": "COMPLETED",
+                    "measurement_available": True,
+                    "measurement_basis": ratio_basis,
+                    "expected_ratio": expected,
+                    "observed_ratio": round(measured_ratio, 4) if measured_ratio is not None else None,
+                    "anomaly_ratio": round(measured_ratio - expected, 4) if measured_ratio is not None else None,
+                    "congestion_level": self._congestion_level(measured_ratio) if measured_ratio is not None else None,
+                    "current_speed_mph": current_speed,
+                    "free_flow_speed_mph": base_speed,
                     "delay_seconds": delay_sec,
                     "delay_percentage": delay_pct,
-                    "anomaly_ratio": anomaly,
                 },
-                probability=round(min(1.0, max(0.0, 1.0 - speed_ratio)), 4),
+                # Confidence in the deviation, from measurement count only.
+                # Not a probability of congestion, which this model does not
+                # estimate.
+                probability=round(ratio_confidence, 4),
                 calibration_version=CALIBRATION_VERSION,
             )
         )
 
-        result.notes.append(
-            f"traffic anomaly {anomaly:+.2f} vs baseline {expected:.2f} ({cong_level}, {delay_sec:.0f}s delay); "
-            "attribution to this event NOT asserted"
-        )
+        if measured_ratio is not None:
+            result.notes.append(
+                f"traffic anomaly {anomaly:+.2f} vs baseline {expected:.2f} ({cong_level}) "
+                f"from {ratio_basis}; attribution to this event NOT asserted"
+            )
+        else:
+            result.notes.append(
+                "traffic reported absolute measurements but no speed ratio or "
+                "free-flow reference, so no deviation is claimed"
+            )
         return result
+
+    def _unmeasured(
+        self,
+        result: CapabilityResult,
+        ctx: CapabilityContext,
+        *,
+        expected: float,
+        has_closure: bool,
+        affected_segments: list[str],
+    ) -> CapabilityResult:
+        """No traffic has been measured. Report exactly that.
+
+        The previous version of this path returned an observed ratio of
+        ``expected * 0.45`` at confidence 0.70 whenever a closure was present,
+        which is a fabricated observation with a fabricated confidence attached
+        to it. A closure is evidence about infrastructure, not about traffic
+        flow, so it is recorded as context and no traffic quantity is derived
+        from it.
+        """
+
+        result.features["traffic_measurement_available"] = FeatureValue(
+            name="traffic_measurement_available",
+            value=False,
+            confidence=1.0,
+        )
+        result.features["traffic_confidence"] = FeatureValue(
+            name="traffic_confidence",
+            value=0.0,
+        )
+
+        result.model_outputs.append(
+            ModelOutput(
+                model_id="baseline-traffic-anomaly",
+                model_version=self.model_version,
+                prediction_time=utcnow(),
+                input_state_version=ctx.state.state_version,
+                output={
+                    "status": "NO_MEASUREMENT",
+                    "measurement_available": False,
+                    "measurement_basis": "no traffic observation carried a speed, ratio or travel time",
+                    "expected_ratio": expected,
+                    "observed_ratio": None,
+                    "anomaly_ratio": None,
+                    "congestion_level": None,
+                    "current_speed_mph": None,
+                    "free_flow_speed_mph": None,
+                    "delay_seconds": None,
+                    "delay_percentage": None,
+                    "road_closure_present": has_closure,
+                },
+                # No deviation was measured, so no confidence in one is claimed.
+                probability=None,
+                calibration_version=CALIBRATION_VERSION,
+            )
+        )
+
+        if has_closure:
+            result.notes.append(
+                "road closure present but no traffic measurement available; no "
+                "traffic anomaly, delay or congestion level is reported. "
+                "Congestion is plausible and unobserved - these are different, "
+                "and only the second is reportable."
+            )
+        else:
+            result.notes.append(
+                "no traffic measurement available for this event; baseline "
+                f"expectation {expected:.2f} recorded, nothing observed"
+            )
+        return result
+
+    @staticmethod
+    def _observed_ratios(ctx: CapabilityContext) -> list[float]:
+        """Speed ratios the evidence actually carries."""
+
+        found: list[float] = []
+        for o in ctx.observations:
+            if o.observation_type not in {ObservationType.TRAFFIC_CONDITION, ObservationType.TRAFFIC_FLOW}:
+                continue
+            raw = o.structured_payload.get("speed_ratio") or o.structured_payload.get("congestion_ratio")
+            if raw is None:
+                continue
+            found.append(float(raw))
+        return found
+
+    @staticmethod
+    def _observed_speeds(ctx: CapabilityContext) -> list[dict[str, float]]:
+        """Absolute speeds, only where reported alongside their reference."""
+
+        found: list[dict[str, float]] = []
+        for o in ctx.observations:
+            if o.observation_type not in {ObservationType.TRAFFIC_CONDITION, ObservationType.TRAFFIC_FLOW}:
+                continue
+            speed = o.structured_payload.get("speed_mph")
+            if speed is None:
+                continue
+            free_flow = o.structured_payload.get("free_flow_speed_mph")
+            found.append({"speed_mph": float(speed), "free_flow_mph": float(free_flow) if free_flow else 0.0})
+        return found
+
+    @staticmethod
+    def _observed_travel_times(ctx: CapabilityContext) -> list[dict[str, float]]:
+        """Travel times, only where reported alongside their free-flow reference."""
+
+        found: list[dict[str, float]] = []
+        for o in ctx.observations:
+            if o.observation_type != ObservationType.TRAVEL_TIME:
+                continue
+            travel = o.structured_payload.get("travel_time_seconds")
+            if travel is None:
+                continue
+            free_flow = o.structured_payload.get("free_flow_travel_time_seconds")
+            found.append({"travel_time_s": float(travel), "free_flow_s": float(free_flow) if free_flow else 0.0})
+        return found
+
+    @classmethod
+    def _congestion_level(cls, ratio: float) -> str:
+        for threshold, label in cls.CONGESTION_BANDS:
+            if ratio < threshold:
+                return label
+        return "NORMAL"
 
     @staticmethod
     def _period(ctx: CapabilityContext) -> tuple[str, str]:
@@ -304,6 +486,7 @@ class TrafficAnomalyCapability(AnalysisCapability):
         else:
             period = "evening"
         return (day_type, period)
+
 
 
 class InfrastructureImpactCapability(AnalysisCapability):

@@ -28,7 +28,8 @@ from ..config import Settings, get_region, get_settings
 from ..domain.ids import utcnow
 from ..domain.schemas import SCHEMA_VERSION
 from ..storage.sqlite_driver import SqlitePlatformRepository
-from .routes import events, internal, regions, stream, user
+from .routes import events, internal, observations, regions, sources, stream, user, world
+from ..ui.routes import router as ui_router
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,10 @@ def create_app(
     app.include_router(user.router)
     app.include_router(regions.router)
     app.include_router(stream.router)
+    app.include_router(sources.router)
+    app.include_router(observations.router)
+    app.include_router(ui_router)
+    app.include_router(world.router)
     app.include_router(internal.router)
 
     @app.get("/healthz", tags=["ops"])

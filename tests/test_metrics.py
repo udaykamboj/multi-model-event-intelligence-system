@@ -556,7 +556,13 @@ class TestMultiSystemIntelligenceRoles:
         assert 0.0 < conn < 1.0
 
     def test_traffic_analysis_capability_computes_features(self):
-        """Traffic analysis must compute speed, delay, congestion from data, not heuristics."""
+        """Traffic analysis computes speed and delay from reported measurements.
+
+        Absolute speeds and travel times require the feed to report them, plus a
+        free-flow reference to compare against. A bare ratio is enough to
+        classify congestion but not enough to state a speed or a delay, and
+        those are not inferred from a generic default.
+        """
         from infraimpact.analysis.capabilities import CapabilityContext
         from infraimpact.analysis.prediction import TrafficAnomalyCapability
 
@@ -565,9 +571,13 @@ class TestMultiSystemIntelligenceRoles:
         obs = [
             _make_observation("obs_t1", ObservationType.TRAFFIC_FLOW),
             _make_observation("obs_t2", ObservationType.ROAD_CLOSURE),
+            _make_observation("obs_t3", ObservationType.TRAVEL_TIME),
         ]
-        # Attach speed ratio to observation
         obs[0].structured_payload["speed_ratio"] = 0.30
+        obs[0].structured_payload["speed_mph"] = 15.0
+        obs[0].structured_payload["free_flow_speed_mph"] = 50.0
+        obs[2].structured_payload["travel_time_seconds"] = 900.0
+        obs[2].structured_payload["free_flow_travel_time_seconds"] = 300.0
 
         ctx = CapabilityContext(
             region_id="puget-sound",
@@ -580,9 +590,85 @@ class TestMultiSystemIntelligenceRoles:
         assert "traffic_expected_baseline_speed_mph" in res.features
         assert "traffic_delay_seconds" in res.features
         assert "traffic_congestion_level" in res.features
+        assert res.features["traffic_current_speed_mph"].value == 15.0
+        assert res.features["traffic_expected_baseline_speed_mph"].value == 50.0
         # Speed ratio 0.30 should classify as GRIDLOCK
         assert res.features["traffic_congestion_level"].value == "GRIDLOCK"
-        assert res.features["traffic_delay_seconds"].value > 0.0
+        # 900s observed against a 300s free flow.
+        assert res.features["traffic_delay_seconds"].value == 600.0
+
+    def test_traffic_with_no_measurement_invents_nothing(self):
+        """A closure with no traffic data must not become a traffic observation.
+
+        This capability used to report 0.45 x baseline at confidence 0.70
+        whenever a road closure was present, and to name "road:4th-ave" when no
+        segment had been identified. Both were fabrications that were
+        indistinguishable from measurements, in the one domain where acting on a
+        wrong number sends someone the wrong way.
+        """
+        from infraimpact.analysis.capabilities import CapabilityContext
+        from infraimpact.analysis.prediction import TrafficAnomalyCapability
+
+        cap = TrafficAnomalyCapability()
+        state = _make_sample_state()
+        obs = [_make_observation("obs_c1", ObservationType.ROAD_CLOSURE)]
+
+        ctx = CapabilityContext(
+            region_id="puget-sound",
+            state=state,
+            observations=obs,
+            claims=[],
+        )
+        res = cap.run(ctx)
+
+        # Nothing measured, so nothing measured-shaped is emitted.
+        assert res.features["traffic_measurement_available"].value is False
+        assert res.features["traffic_confidence"].value == 0.0
+        for fabricated in (
+            "traffic_observed_speed_ratio",
+            "traffic_anomaly",
+            "traffic_current_speed_mph",
+            "traffic_expected_baseline_speed_mph",
+            "traffic_delay_seconds",
+            "traffic_delay_percentage",
+            "traffic_travel_time_seconds",
+            "traffic_congestion_level",
+        ):
+            assert fabricated not in res.features, f"{fabricated} was invented"
+
+        # Segments are reported only when the state carries real ones. The
+        # previous code fell back to the literal "road:4th-ave" whenever the
+        # state had none, so the identifier appeared whether or not anything had
+        # observed it.
+        segments = res.features["traffic_affected_road_segments"].value
+        expected_ids = [
+            i.identifier
+            for i in state.affected_infrastructure
+            if i.domain == InfrastructureDomain.ROAD
+        ]
+        assert segments == expected_ids
+
+        # A closure with nothing observed and no affected infrastructure: the
+        # capability used to name a street here out of thin air.
+        bare = _make_sample_state().model_copy(
+            update={"affected_infrastructure": ()}
+        )
+        bare_res = cap.run(
+            CapabilityContext(region_id="puget-sound", state=bare, observations=obs, claims=[])
+        )
+        assert "traffic_affected_road_segments" not in bare_res.features
+
+        # The expectation is still reportable; it is an expectation.
+        assert "traffic_baseline_expected_ratio" in res.features
+
+        output = res.model_outputs[0].output
+        assert output["status"] == "NO_MEASUREMENT"
+        assert output["observed_ratio"] is None
+        assert output["congestion_level"] is None
+        assert output["road_closure_present"] is True
+        assert output["measurement_available"] is False
+
+        assert any("not reportable" in note or "no traffic measurement" in note for note in res.notes)
 
     def test_transit_disruption_capability_computes_features(self):
         """Transit capability must compute routes, delays, alerts, and alternate corridors."""
