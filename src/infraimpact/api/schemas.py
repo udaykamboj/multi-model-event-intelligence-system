@@ -37,12 +37,20 @@ class EventSummary(BaseModel):
     event_id: str
     status: str
     region_id: str
+    title: str = ""
+    location: str = ""
+    dominant_type: str = ""
     first_observed: datetime | None = None
     updated_at: datetime | None = None
     closed_at: datetime | None = None
     observation_count: int = 0
+    source_count: int = 1
+    independent_source_count: int = 1
+    confidence: float = 0.5
+    geometry: dict[str, Any] | None = None
     state_version: int | None = None
     last_reconstructed_at: datetime | None = None
+
 
 
 class EventListResponse(BaseModel):
@@ -89,6 +97,7 @@ class EventDetail(BaseModel):
     forecast: list[Forecast] = Field(default_factory=list)
     evidence_summary: EvidenceSummary = Field(default_factory=EvidenceSummary)
     last_updated: datetime | None = None
+
 
 
 class TimelineEntry(BaseModel):

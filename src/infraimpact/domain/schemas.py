@@ -114,6 +114,9 @@ class Observation(BaseModel):
     provenance: Provenance
     quality: ObservationQuality
 
+    centroid: tuple[float, float] | None = None
+    event_id: str | None = None
+
     def dedupe_key(self) -> str:
         """Section 7 dedupe key."""
         from .ids import content_hash, deterministic_id
@@ -122,6 +125,7 @@ class Observation(BaseModel):
         return deterministic_id("dk", explicit) if self.source_record_id else deterministic_id(
             "dk", content_hash(self.structured_payload)
         )
+
 
 
 # --------------------------------------------------------------------------

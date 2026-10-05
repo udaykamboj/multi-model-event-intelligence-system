@@ -23,7 +23,7 @@ from typing import Any, Sequence
 
 from ..domain.enums import InfrastructureDomain, ObservationType
 from ..domain.geo import bbox_polygon, centroid_of, distance_m, haversine_m, union_bbox
-from ..domain.ids import deterministic_id, new_id, utcnow
+from ..domain.ids import deterministic_id, ensure_utc, new_id, utcnow
 from ..domain.schemas import Claim, EventState, MovementState, Observation
 from ..llm.client import LlmClient, NullLlmClient
 from ..storage.repository import (
@@ -40,7 +40,6 @@ EVENT_BEARING_TYPES = frozenset(
     {
         ObservationType.PERMIT_EVENT,
         ObservationType.PUBLIC_GATHERING_REPORT,
-        ObservationType.NEWS_ARTICLE,
         ObservationType.POLICE_RESPONSE,
         ObservationType.FIRE_DISPATCH,
         ObservationType.OFFICIAL_EMERGENCY_NOTICE,
@@ -53,6 +52,42 @@ EVENT_BEARING_TYPES = frozenset(
         ObservationType.POWER_OUTAGE,
     }
 )
+
+#: Cross-compatible types for incidents (police CAD, fire dispatch, road closures, news, traffic)
+INCIDENT_COMPATIBLE_TYPES = frozenset(
+    {
+        ObservationType.POLICE_RESPONSE.value,
+        ObservationType.FIRE_DISPATCH.value,
+        ObservationType.ROAD_CLOSURE.value,
+        ObservationType.ROAD_CONSTRUCTION.value,
+        ObservationType.NEWS_ARTICLE.value,
+        ObservationType.TRAFFIC_FLOW.value,
+        ObservationType.TRAFFIC_CONDITION.value,
+        ObservationType.TRANSIT_SERVICE_ALERT.value,
+        ObservationType.OFFICIAL_EMERGENCY_NOTICE.value,
+    }
+)
+
+#: Common incident synonym mappings to canonicalize semantic similarity
+SYNONYMS: dict[str, str] = {
+    "crash": "collision",
+    "accident": "collision",
+    "crashed": "collision",
+    "wrecks": "collision",
+    "wreck": "collision",
+    "blocked": "closure",
+    "blockage": "closure",
+    "blocking": "closure",
+    "closed": "closure",
+    "closures": "closure",
+    "shutdown": "closure",
+    "delay": "delay",
+    "delays": "delay",
+    "congestion": "delay",
+    "slowdown": "delay",
+    "slow": "delay",
+    "stalled": "delay",
+}
 
 #: Evidence weight by observation type when scoring event-type compatibility.
 TYPE_AFFINITY: dict[ObservationType, float] = {
@@ -84,9 +119,19 @@ _STOPWORDS = frozenset(
     {
         "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for", "is",
         "are", "was", "were", "has", "have", "with", "by", "from", "as", "it",
-        "police", "reported", "reports", "seattle", "downtown",
+        "this", "that", "these", "those", "be", "been", "being", "not", "all",
+        "reported", "reports", "reporting", "update", "updates", "updated",
+        # Generic public safety, news, and dispatch boilerplate
+        "assistance", "rendered", "directed", "patrol", "activity", "checks",
+        "prevention", "priority", "call", "calls", "handling", "officer", "officers",
+        "police", "response", "dispatch", "dispatched", "investigation", "investigating",
+        "incident", "incidents", "premise", "service", "unit", "units", "scene",
+        "unable", "locate", "complainant", "problem", "solving", "project",
+        "seattle", "washington", "department", "issued", "alert", "alerts",
+        "article", "news", "story", "stories", "media", "block", "ave", "st",
     }
 )
+
 
 
 @dataclass
@@ -222,6 +267,9 @@ class EventResolver:
         #: :class:`~infraimpact.events.identity.EventIdentityAllocator` for why
         #: the id cannot be a hash of region/type/day.
         self.identities = EventIdentityAllocator(region_id)
+        from .claims import RuleClaimExtractor
+
+        self.claim_extractor = RuleClaimExtractor()
         #: Scoped to a single :meth:`resolve` call and cleared on the way out,
         #: so it can never go stale across a burst of observations that opens new
         #: events. An instance attribute only because ``_candidates`` is reached
@@ -231,6 +279,7 @@ class EventResolver:
         #: Events the ledger already knows about, for identity allocation. Same
         #: per-burst scoping as ``_active_cache``.
         self._known_events_cache: set[str] | None = None
+
 
     # -- public API -------------------------------------------------------
 
@@ -350,21 +399,45 @@ class EventResolver:
         )
         self.events.ensure(allocation.event_id, observation.event_time, self.region_id)
         self.events.link_observation(allocation.event_id, observation.observation_id)
+        now = utcnow()
+        event_time = ensure_utc(observation.event_time)
+        if event_time > now + timedelta(days=1) or (
+            observation.observation_type == ObservationType.PERMIT_EVENT and event_time > now
+        ):
+            initial_status = "planned"
+        elif (now - event_time).total_seconds() > 7 * 86400:
+            initial_status = "closed"
+        elif observation.observation_type in (
+            ObservationType.BRIDGE_RESTRICTION,
+            ObservationType.FERRY_STATUS,
+            ObservationType.NEWS_ARTICLE,
+            ObservationType.WEATHER_CONDITION,
+            ObservationType.VEHICLE_POSITION,
+            ObservationType.CAMERA_IMAGERY,
+        ):
+            initial_status = "quiescent"
+        elif observation.observation_type not in EVENT_BEARING_TYPES:
+            initial_status = "quiescent"
+        else:
+            initial_status = "active"
+
         self.events.set_status(
             allocation.event_id,
-            "active",
+            initial_status,
             observation.observed_at,
             f"first report: {allocation.basis}",
         )
         if self._known_events_cache is not None:
             self._known_events_cache.add(allocation.event_id)
         log.info(
-            "opened event %s for observation %s (%s, ordinal %d)",
+            "opened event %s for observation %s (%s, ordinal %d, status=%s)",
             allocation.event_id,
             observation.observation_id,
             allocation.basis,
             allocation.ordinal,
+            initial_status,
         )
+
         return Resolution(
             event_id=allocation.event_id,
             is_new_event=True,
@@ -430,45 +503,50 @@ class EventResolver:
     # -- candidate generation (cheap constraints first) --------------------
 
     def _candidates(self, observation: Observation) -> list[Candidate]:
-        # The time window, applied in SQL. This is the constraint the module
-        # docstring promises as the first cheap deterministic filter, and it was
-        # being computed and thrown away (``_ = window_start``) while the scan
-        # below walked every active event. See
-        # :meth:`ObservationRepository.event_ids_between` for the arithmetic:
-        # per-observation resolution against a full scan is O(observations x
-        # events) round-trips, and the supplied feeds produced roughly twelve
-        # million of them on a cold ingest.
         margin = self.time_window_min * 60
         window_start = observation.event_time - timedelta(seconds=margin)
         window_end = observation.event_time + timedelta(seconds=margin)
 
+        reachable = self._reachable()
+        candidate_ids = set(self.observations.event_ids_between(window_start, window_end))
+
         out: list[Candidate] = []
-        for event_id in self.observations.event_ids_between(window_start, window_end):
-            if event_id not in self._reachable():
+        checked: set[str] = set()
+
+        for event_id in candidate_ids:
+            if event_id not in reachable:
                 continue
-            obs = self.observations.list_for_event(event_id)
-            if not obs:
+            checked.add(event_id)
+            cand = self._build_candidate(event_id, observation)
+            if cand is not None:
+                out.append(cand)
+
+        # Also inspect reachable active events within temporal and spatial reach
+        for event_id in reachable:
+            if event_id in checked:
                 continue
-            if not self._temporally_compatible(observation, obs):
-                continue
-            candidate = Candidate(
-                event_id,
-                self._latest_state(event_id),
-                obs,
-                self.claims_repo.claims_for_event(event_id),
-            )
-            # The binding constraint. A road closure in Ballard and one on
-            # Aurora are both "road closure, this hour", so time and type
-            # similarity will happily rate them alike; distance is what
-            # distinguishes them. Testing it before scoring is what turns the
-            # final weighted sum from a rubber stamp into a decision - without
-            # this, spatial proximity was only ever 30% of a score that needed
-            # 62% to pass.
-            if observation.geometry and candidate.geometry:
-                if distance_m(observation.geometry, candidate.geometry) > self.search_radius_m:
-                    continue
-            out.append(candidate)
+            cand = self._build_candidate(event_id, observation)
+            if cand is not None:
+                out.append(cand)
+
         return out
+
+    def _build_candidate(self, event_id: str, observation: Observation) -> Candidate | None:
+        obs = self.observations.list_for_event(event_id)
+        if not obs:
+            return None
+        if not self._temporally_compatible(observation, obs):
+            return None
+        candidate = Candidate(
+            event_id,
+            self._latest_state(event_id),
+            obs,
+            self.claims_repo.claims_for_event(event_id),
+        )
+        if observation.geometry and candidate.geometry:
+            if distance_m(observation.geometry, candidate.geometry) > self.search_radius_m:
+                return None
+        return candidate
 
     def _reachable(self) -> set[str]:
         """Events that could receive a new observation.
@@ -494,31 +572,7 @@ class EventResolver:
         return self._active_cache
 
     def _recoverable(self) -> set[str]:
-        """Closed events that a new report is allowed to reopen.
-
-        Closure is not final, but not every closure deserves to be undone either,
-        so the two are separated by *why* the event was closed rather than by how
-        long ago.
-
-        An event closed because an official record said it had ended, or because
-        its last disruption was formally retired, stays closed. Those are
-        statements about the world, not inferences from its silence, and a late
-        duplicate report should not resurrect one.
-
-        An event closed because nothing was heard for a while is recoverable.
-        That closure was a guess, and a guess that turns out to be wrong should
-        be corrected rather than compounded: the new report belongs to the
-        situation already on file, and opening a second id for it would split
-        one real event into two fictional ones.
-
-        Note this is not gated on how long ago the event closed. An earlier
-        version used a fixed horizon, which made reopening unreachable in
-        practice: the horizon was longer than the candidate time window, so by
-        the time an event was old enough to be eligible, its observations had
-        already fallen out of the window that finds candidates at all. Bounded
-        instead by how many closed events are examined, most recent first.
-        """
-
+        """Closed events that a new report is allowed to reopen."""
         rows = self.events.all_events()
         closed = [r for r in rows if r.get("status") == "closed"][:_RECOVERY_CLOSED_LIMIT]
         out: set[str] = set()
@@ -533,12 +587,9 @@ class EventResolver:
         if not siblings:
             return True
         times = [o.event_time for o in siblings]
-        earliest, latest = min(times), max(times)
+        nearest = min(abs((observation.event_time - t).total_seconds()) for t in times)
         margin = self.time_window_min * 60
-        return (
-            (observation.event_time - earliest).total_seconds() <= margin
-            and (latest - observation.event_time).total_seconds() <= margin
-        )
+        return nearest <= margin
 
     # -- scoring ----------------------------------------------------------
 
@@ -550,21 +601,23 @@ class EventResolver:
     ) -> Resolution:
         evidence: dict[str, float] = {}
 
-        # 1. spatial overlap / proximity
+        # 1. shared entities / lexical overlap (computed first for location cues)
+        entities = self._entity_overlap(observation, candidate, existing_claims)
+        evidence["entity_overlap"] = entities
+
+        # 2. spatial overlap / proximity
         spatial = self._spatial(observation, candidate)
+        if (not observation.geometry or not candidate.geometry) and entities > 0.0:
+            spatial = max(spatial, min(0.85, entities * 1.5))
         evidence["spatial"] = spatial
 
-        # 2. temporal distance
+        # 3. temporal distance
         temporal = self._temporal(observation, candidate)
         evidence["temporal"] = temporal
 
-        # 3. event-type compatibility
+        # 4. event-type compatibility
         compatibility = self._type_compatibility(observation, candidate)
         evidence["type_compatibility"] = compatibility
-
-        # 4. shared entities / lexical overlap
-        entities = self._entity_overlap(observation, candidate, existing_claims)
-        evidence["entity_overlap"] = entities
 
         # 5. claim continuity (does the observation continue an existing claim?)
         continuity = self._claim_continuity(observation, candidate, existing_claims)
@@ -596,9 +649,7 @@ class EventResolver:
 
     def _spatial(self, observation: Observation, candidate: Candidate) -> float:
         if not observation.geometry or not candidate.geometry:
-            # An official record without geometry should not be discarded; treat
-            # missing geometry as weak-neutral rather than disqualifying.
-            return 0.4 if observation.provenance.authority.value == "official" else 0.15
+            return 0.45 if observation.provenance.authority.value == "official" else 0.25
         d = distance_m(observation.geometry, candidate.geometry)
         if d == 0:
             return 1.0
@@ -613,65 +664,52 @@ class EventResolver:
         return max(0.0, 1.0 - (nearest / (self.time_window_min * 60)))
 
     def _type_compatibility(self, observation: Observation, candidate: Candidate) -> float:
-        """How well does this observation's type fit what the event is made of?
-
-        Note what this does *not* encode: any relation between two different
-        incident types. ``TYPE_AFFINITY`` says how strongly a type implies that
-        an event exists at all, not whether an earthquake and a road closure are
-        related, so it cannot answer "is this the same kind of thing". Every
-        value in it is positive, which means two simultaneous incidents of
-        different types always look somewhat compatible here. That gap is real
-        and is closed structurally by :meth:`_has_corroboration` rather than by
-        inventing a pairwise table that would have to be maintained per domain.
-        """
-
         obs_type = observation.observation_type
         affinity = TYPE_AFFINITY.get(obs_type, 0.2)
         state_types = candidate.observation_types
         if obs_type.value in state_types:
             return min(1.0, affinity + 0.4)
-        # Related-but-different types (a closure alongside a gathering) still
-        # support association, just weakly.
+        if obs_type.value in INCIDENT_COMPATIBLE_TYPES and any(t in INCIDENT_COMPATIBLE_TYPES for t in state_types):
+            return min(1.0, affinity + 0.3)
         return affinity
 
     def _has_corroboration(self, evidence: dict[str, float]) -> bool:
-        """Is there positive evidence that two records describe one situation?
-
-        Spatial and temporal proximity alone are not identity. Two separate
-        things routinely happen at the same place at the same time - that is
-        what a city is - so a pair scoring well on proximity and nothing else is
-        far more likely to be two events than one. Requiring a second,
-        independent signal (shared entities, or a claim the candidate already
-        asserts) is what stops proximity from quietly doing the deciding on its
-        own.
-
-        The two signals are named rather than thresholded because "enough" is
-        not a number here: entity overlap is a lexical measure that reports 0.0
-        for a perfectly real match with different wording, while claim
-        continuity is a structured assertion that reports 0.0 for a real match
-        that happens to say something new.
-        """
-
-        return evidence.get("entity_overlap", 0.0) > 0.0 or evidence.get(
-            "claim_continuity", 0.0
-        ) > 0.3
+        """Is there positive evidence that two records describe one situation?"""
+        is_spatiotemporal = (
+            evidence.get("spatial", 0.0) >= 0.80
+            and evidence.get("temporal", 0.0) >= 0.70
+            and evidence.get("type_compatibility", 0.0) >= 0.40
+        )
+        has_entities = evidence.get("entity_overlap", 0.0) >= 0.40
+        has_claims = evidence.get("claim_continuity", 0.0) >= 0.50
+        return is_spatiotemporal or has_entities or has_claims
 
     def _entity_overlap(
         self, observation: Observation, candidate: Candidate, existing_claims: Sequence[Claim]
     ) -> float:
         text = _tokens(f"{observation.headline} {observation.structured_payload}")
         if not text:
-            return 0.2
+            return 0.0
         candidate_text: set[str] = set()
         for obs in candidate.observations:
             candidate_text |= _tokens(f"{obs.headline} {obs.structured_payload}")
         for claim in candidate.claims:
-            if claim.predicate == "location.name" and claim.value:
+            if claim.predicate in ("location.name", "road.affected", "incident.id") and claim.value:
                 candidate_text |= _tokens(str(claim.value))
         if not candidate_text:
-            return 0.2
-        overlap = len(text & candidate_text) / max(1, len(text))
-        return min(1.0, overlap * 2.0)
+            return 0.0
+        overlap_tokens = text & candidate_text
+        if not overlap_tokens:
+            return 0.0
+        has_strong_entity = any(
+            t.startswith(("i_", "sr_", "us_", "exit_", "mp_")) for t in overlap_tokens
+        )
+        overlap = len(overlap_tokens) / max(1, len(text))
+        if has_strong_entity:
+            return min(1.0, max(0.60, overlap * 2.0))
+        if len(overlap_tokens) >= 2 or overlap >= 0.30:
+            return min(1.0, overlap * 2.0)
+        return 0.0
 
     def _claim_continuity(
         self,
@@ -679,20 +717,19 @@ class EventResolver:
         candidate: Candidate,
         existing_claims: Sequence[Claim] = (),
     ) -> float:
-        """Strong signal: two records asserting the same predicate+value.
+        incoming = existing_claims
+        if not incoming and hasattr(self, "claim_extractor") and self.claim_extractor:
+            incoming = self.claim_extractor.extract(observation, "")
 
-        This is what links "police report the event moved north" to the permit
-        event, without relying on prose similarity.
-        """
-        _ = observation
-        if not existing_claims or not candidate.claims:
-            return 0.2
-        incoming = {(c.predicate, _norm(c.value)) for c in existing_claims}
-        prior = {(c.predicate, _norm(c.value)) for c in candidate.claims}
-        shared = incoming & prior
+        if not incoming or not candidate.claims:
+            return 0.0
+        incoming_pairs = {(c.predicate, _norm(c.value)) for c in incoming}
+        prior_pairs = {(c.predicate, _norm(c.value)) for c in candidate.claims}
+        shared = incoming_pairs & prior_pairs
         if not shared:
             return 0.15
-        return min(1.0, 0.5 + 0.2 * len(shared))
+        return min(1.0, 0.5 + 0.25 * len(shared))
+
 
     def _movement_compatibility(self, observation: Observation, candidate: Candidate) -> float:
         """Section 10: movement compatibility.
@@ -789,9 +826,28 @@ class EventResolver:
         }
 
 
+def _canonicalize_text(raw: str) -> str:
+    s = str(raw).lower()
+    s = re.sub(r"\b(?:interstate\s*|i-?)(5|90|405)\b", r"i_\1", s)
+    s = re.sub(r"\b(?:state\s*route\s*|sr-?|wa-?)(99|520|522|167|16|2)\b", r"sr_\1", s)
+    s = re.sub(r"\b(?:u\.?s\.?\s*route\s*|us-?)(2|101)\b", r"us_\1", s)
+    s = re.sub(r"\bexit\s*#?\s*(\d+[a-z]?)\b", r"exit_\1", s)
+    s = re.sub(r"\bmilepost\s*#?\s*(\d+)\b", r"mp_\1", s)
+    return s
+
+
 def _tokens(text: str) -> set[str]:
-    words = re.findall(r"[a-z0-9']+", str(text).lower())
-    return {w for w in words if w not in _STOPWORDS and len(w) > 2}
+    clean = _canonicalize_text(text)
+    words = re.findall(r"[a-z0-9_]+", clean)
+    tokens: set[str] = set()
+    for w in words:
+        w_canon = SYNONYMS.get(w, w)
+        if w_canon in _STOPWORDS:
+            continue
+        if w_canon.startswith(("i_", "sr_", "us_", "exit_", "mp_")) or len(w_canon) >= 3:
+            tokens.add(w_canon)
+    return tokens
+
 
 
 def _norm(value: Any) -> str:

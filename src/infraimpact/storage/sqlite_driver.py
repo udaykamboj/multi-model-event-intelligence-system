@@ -556,8 +556,14 @@ class SqliteObservationRepository(_SqliteRepo, ObservationRepository):
         return [_row_to_observation(r) for r in rows]
 
     def recent(self, limit: int = 100) -> list[Observation]:
-        rows = self._query("SELECT * FROM observations ORDER BY observed_at DESC LIMIT ?", (limit,))
+        rows = self._query(
+            """SELECT o.*, eo.event_id FROM observations o
+               LEFT JOIN event_observations eo ON eo.observation_id = o.observation_id
+               ORDER BY o.observed_at DESC LIMIT ?""",
+            (limit,),
+        )
         return [_row_to_observation(r) for r in rows]
+
 
     def count(self) -> int:
         rows = self._query("SELECT COUNT(*) AS c FROM observations")
@@ -1311,7 +1317,13 @@ class SqlitePlatformRepository(PlatformRepository):
 def _row_to_observation(row: sqlite3.Row) -> Observation:
     import json as _json
 
+    from ..domain.geo import centroid_of
     from ..domain.schemas import ObservationQuality, Provenance
+
+    geom = _json.loads(row["geometry"]) if row["geometry"] else None
+    c = centroid_of(geom) if geom else None
+    centroid = (round(c[0], 6), round(c[1], 6)) if c else None
+    event_id = row["event_id"] if "event_id" in row.keys() and row["event_id"] else None
 
     return Observation(
         observation_id=row["observation_id"],
@@ -1323,7 +1335,7 @@ def _row_to_observation(row: sqlite3.Row) -> Observation:
         ingested_at=row["ingested_at"],
         source_type=row["source_type"],
         observation_type=row["observation_type"],
-        geometry=_json.loads(row["geometry"]) if row["geometry"] else None,
+        geometry=geom,
         location_precision_m=row["location_precision_m"],
         headline=row["headline"],
         structured_payload=_json.loads(row["structured_payload"]),
@@ -1331,7 +1343,10 @@ def _row_to_observation(row: sqlite3.Row) -> Observation:
         quality=ObservationQuality.model_validate(_json.loads(row["quality"])),
         source_url=row["source_url"],
         raw_payload_uri=row["raw_payload_uri"],
+        centroid=centroid,
+        event_id=event_id,
     )
+
 
 
 def _row_to_claim(row: sqlite3.Row) -> Claim:

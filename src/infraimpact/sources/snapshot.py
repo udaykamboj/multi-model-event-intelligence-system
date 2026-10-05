@@ -822,19 +822,26 @@ def flatten_features(doc: Any, *keys: str) -> list[dict[str, Any]]:
 def feature_geometry(item: dict[str, Any]) -> dict[str, Any] | None:
     """Geometry of an already-flattened feature, tolerating SDOT's shapes.
 
-    Accepts both a GeoJSON geometry object and SDOT's bare
+    Accepts both a GeoJSON geometry object, inline line_strings, and SDOT's bare
     ``PointCoordinate`` pair, which is ``[lat, lon]``.
     """
-
+    if not isinstance(item, dict):
+        return None
     geometry = geometry_from(item.get("geometry"))
     if geometry:
         return geometry
+    for key in ("line_string", "shape", "geom", "the_geom", "spatial_geometry"):
+        if key in item:
+            candidate = geometry_from(item[key])
+            if candidate:
+                return candidate
     raw = item.get("PointCoordinate")
     if isinstance(raw, (list, tuple)) and len(raw) >= 2:
         lat, lon = _as_float(raw[0]), _as_float(raw[1])
         if lat is not None and lon is not None:
             return {"type": "Point", "coordinates": [lon, lat]}
     return geometry_from(item.get("PointCoordinate"))
+
 
 
 def _effective_suffix(path: Path) -> str:

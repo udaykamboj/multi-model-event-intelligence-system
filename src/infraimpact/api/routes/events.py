@@ -118,6 +118,59 @@ def _event_row(repo: Any, event_id: str) -> dict[str, Any]:
     )
 
 
+def _populate_summary_details(summary: EventSummary, state: EventState | None, repo: Any) -> EventSummary:
+    updates: dict[str, Any] = {}
+    if state is not None:
+        updates["state_version"] = state.state_version
+        updates["last_reconstructed_at"] = state.reconstructed_at
+        updates["source_count"] = max(1, state.evidence.source_count)
+        updates["independent_source_count"] = max(1, state.evidence.independent_source_count)
+        updates["confidence"] = state.evidence.vector.get("corroboration_score", state.geometry_confidence) or 0.6
+        updates["geometry"] = state.geometry
+        if state.event_type_distribution:
+            updates["dominant_type"] = max(state.event_type_distribution.items(), key=lambda kv: kv[1])[0]
+        if state.affected_infrastructure:
+            updates["location"] = ", ".join(i.name or i.identifier for i in state.affected_infrastructure[:2])
+
+    obs = repo.observations.list_for_event(summary.event_id)
+    if obs:
+        updates["observation_count"] = len(obs)
+        if not updates.get("source_count"):
+            updates["source_count"] = len({o.source_id for o in obs})
+            updates["independent_source_count"] = updates["source_count"]
+        if not updates.get("geometry"):
+            updates["geometry"] = next((o.geometry for o in obs if o.geometry), None)
+        if not updates.get("dominant_type"):
+            updates["dominant_type"] = obs[0].observation_type.value
+
+        # Pick best human headline for event title
+        headlines = [o.headline.strip() for o in obs if o.headline and o.headline.strip()]
+        if headlines:
+            title = headlines[0]
+            for h in headlines:
+                if len(h) > len(title) or any(k in h.lower() for k in ("collision", "crash", "closure", "fire", "alert", "march")):
+                    title = h
+                    break
+            updates["title"] = title
+        else:
+            dtype = updates.get("dominant_type") or "incident"
+            loc = updates.get("location") or ""
+            updates["title"] = f"{dtype.replace('_', ' ').title()}{(' on ' + loc) if loc else ''}"
+
+        if not updates.get("location"):
+            for o in obs:
+                p = o.structured_payload or {}
+                loc_cand = p.get("street") or p.get("location") or p.get("street_on") or p.get("address")
+                if loc_cand:
+                    updates["location"] = str(loc_cand)
+                    break
+    else:
+        if not updates.get("title"):
+            updates["title"] = f"Event {summary.event_id}"
+
+    return summary.model_copy(update=updates)
+
+
 # --------------------------------------------------------------------------
 # routes
 # --------------------------------------------------------------------------
@@ -145,13 +198,7 @@ async def list_events(
     for row in rows:
         summary = _summary_from_row(row)
         state = repo.states.latest(summary.event_id)
-        if state is not None:
-            summary = summary.model_copy(
-                update={
-                    "state_version": state.state_version,
-                    "last_reconstructed_at": state.reconstructed_at,
-                }
-            )
+        summary = _populate_summary_details(summary, state, repo)
         summaries.append(summary)
     return EventListResponse(count=len(summaries), events=summaries)
 
@@ -166,15 +213,9 @@ async def get_event(event_id: str, repo: RepoDep) -> EventDetail:
     row = _event_row(repo, event_id)
     summary = _summary_from_row(row)
     state = repo.states.latest(event_id)
+    summary = _populate_summary_details(summary, state, repo)
     run = repo.runs.latest_for_event(event_id)
 
-    if state is not None:
-        summary = summary.model_copy(
-            update={
-                "state_version": state.state_version,
-                "last_reconstructed_at": state.reconstructed_at,
-            }
-        )
 
     return EventDetail(
         event=summary,
@@ -185,6 +226,7 @@ async def get_event(event_id: str, repo: RepoDep) -> EventDetail:
         evidence_summary=state.evidence if state else EvidenceSummary(),
         last_updated=_maybe_dt(row.get("updated_at")),
     )
+
 
 
 def _recent_changes(runs: list[AnalysisRun]) -> list[RecentChange]:

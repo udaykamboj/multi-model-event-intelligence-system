@@ -76,11 +76,12 @@ LIVE_SOURCE_ENDPOINTS: tuple[SourceEndpoint, ...] = (
     ),
     SourceEndpoint(
         source_id="seattle_special_events",
-        url="https://data.seattle.gov/resource/dm95-f8w5.json?$limit=500",
+        url="https://data.seattle.gov/resource/dm95-f8w5.json?$limit=500&$order=event_start_date%20DESC",
         target_filename="seattle_special_events_permits.json",
         feed_format="json",
         description="Seattle Special Events Permits (rallies, marches, parades)",
     ),
+
     SourceEndpoint(
         source_id="sdot_street_closures",
         url="https://data.seattle.gov/resource/ium9-iqtc.json?$limit=500",
@@ -111,7 +112,7 @@ LIVE_SOURCE_ENDPOINTS: tuple[SourceEndpoint, ...] = (
     ),
     SourceEndpoint(
         source_id="nws_active_alerts",
-        url="https://api.weather.gov/alerts/active?status=actual",
+        url="https://api.weather.gov/alerts/active?status=actual&area=WA",
         target_filename="nws_active_alerts.json",
         feed_format="geojson",
         description="National Weather Service Active Watches & Warnings",

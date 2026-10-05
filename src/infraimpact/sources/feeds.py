@@ -106,10 +106,22 @@ class FeedAdapter(SnapshotAdapter):
         found = feature_geometry(item)
         if found:
             return found
-        return point_from_latlon(
-            item.get("latitude") or item.get("lat") or item.get("Latitude"),
-            item.get("longitude") or item.get("lon") or item.get("long") or item.get("Longitude"),
+        lat = (
+            item.get("dispatch_latitude")
+            or item.get("latitude")
+            or item.get("lat")
+            or item.get("Latitude")
+            or item.get("y")
         )
+        lon = (
+            item.get("dispatch_longitude")
+            or item.get("longitude")
+            or item.get("lon")
+            or item.get("long")
+            or item.get("Longitude")
+            or item.get("x")
+        )
+        return point_from_latlon(lat, lon)
 
     def normalize(self, record: RawRecord) -> Observation | None:  # noqa: D102
         raise NotImplementedError
@@ -178,6 +190,9 @@ class SpdCadAdapter(FeedAdapter):
                 "response_category": item.get("cad_event_response_category"),
                 "event_group": item.get("event_group"),
                 "classification": item.get("call_type_received_classification"),
+                "address": item.get("dispatch_address") or item.get("address"),
+                "street": item.get("dispatch_address") or item.get("address"),
+                "location": f"{item.get('dispatch_address') or ''} ({neighbourhood})".strip(" ()"),
                 "neighborhood": neighbourhood or None,
                 "precinct": item.get("dispatch_precinct"),
                 "sector": item.get("dispatch_sector"),
@@ -422,13 +437,24 @@ class NewsFeedAdapter(FeedAdapter):
         return self._event_time(item)
 
     def normalize(self, record: RawRecord) -> Observation:
-        item: dict[str, Any] = record.payload
-        _, authority = self.trust
+        title_lower = (item.get("title") or "").lower()
+        desc_lower = (item.get("description") or "").lower()
+        combined = f"{title_lower} {desc_lower}"
+        obs_type = ObservationType.NEWS_ARTICLE
+        if any(k in combined for k in ("shooting", "gunfire", "shots fired", "homicide", "stabbing", "assault", "bank robbery", "armed robbery")):
+            obs_type = ObservationType.POLICE_RESPONSE
+        elif any(k in combined for k in ("crash", "collision", "rollover", "pileup", "lanes blocked", "road blocked")):
+            obs_type = ObservationType.ROAD_CLOSURE
+        elif any(k in combined for k in ("structure fire", "house fire", "building fire", "apartment fire", "2-alarm fire", "3-alarm fire")):
+            obs_type = ObservationType.FIRE_DISPATCH
+        elif any(k in combined for k in ("flash flood", "flood warning", "wind advisory", "high wind warning", "winter storm warning")):
+            obs_type = ObservationType.SEVERE_WEATHER
+
         return self.observation(
             record,
             item=item,
             geometry=None,
-            observation_type=ObservationType.NEWS_ARTICLE,
+            observation_type=obs_type,
             headline=_text(item.get("title")),
             structured_payload={
                 "title": item.get("title"),
@@ -437,6 +463,7 @@ class NewsFeedAdapter(FeedAdapter):
                 "outlet": self.outlet,
                 "categories": item.get("categories"),
                 "narrative_source": "rss",
+                "inferred_incident_type": obs_type.value,
                 "raw": item,
             },
             precision_m=5000.0,
@@ -473,10 +500,23 @@ class StreetUseAdapter(FeedAdapter):
         return json_records(doc, "data", "features")
 
     def _event_time(self, item: dict[str, Any]) -> Any:
-        return parse_feed_time(item.get("start_date"))
+        t = parse_feed_time(item.get("start_date"))
+        if t and t.year > 2050:
+            t = t.replace(year=2024)
+        return t
 
     def _observed_at(self, item: dict[str, Any]) -> Any:
-        return self._event_time(item)
+        created = parse_feed_time(
+            item.get("issue_date") or item.get("created_date") or item.get("application_date")
+        )
+        if created:
+            return created
+        event_t = self._event_time(item)
+        now = utcnow()
+        if event_t and event_t > now:
+            return now
+        return event_t or now
+
 
     def normalize(self, record: RawRecord) -> Observation:
         item: dict[str, Any] = record.payload
@@ -1305,8 +1345,25 @@ class NwsAlertsSnapshotAdapter(FeedAdapter):
     def _source_url(self, item: dict[str, Any]) -> str | None:
         return item.get("@id") or item.get("id") or None
 
-    def normalize(self, record: RawRecord) -> Observation:
+    def normalize(self, record: RawRecord) -> Observation | None:
         item: dict[str, Any] = record.payload
+        sender = str(item.get("senderName") or "")
+        area_desc = str(item.get("areaDesc") or "")
+        geocode = item.get("geocode") or {}
+        ugc = geocode.get("UGC") or []
+        same = geocode.get("SAME") or []
+        is_wa = (
+            "WA" in sender
+            or "Seattle" in sender
+            or "Spokane" in sender
+            or "Portland" in sender
+            or any(str(u).startswith(("WA", "PZZ")) for u in ugc)
+            or any(str(s).startswith("053") for s in same)
+            or "Washington" in area_desc
+        )
+        if not is_wa:
+            return None
+
         event_name = _text(item.get("event"), 100) or "Weather Alert"
         is_guidance = event_name in SAFETY_CRITICAL
         instruction = item.get("instruction")
